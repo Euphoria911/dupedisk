@@ -165,6 +165,28 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(data["groups"]), 1)
             self.assertEqual(data["reclaimable"], len(b"dupe-content"))
 
+    def test_dupes_csv(self):
+        import csv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "a,1.txt", b"dupe-content")  # comma in the name must stay one field
+            write(root, "b.txt", b"dupe-content")
+            write(root, "c.txt", b"other-stuff!!")
+            write(root, "d.txt", b"other-stuff!!")
+            code, out = self.run_cli("dupes", tmp, "--csv")
+            rows = list(csv.reader(io.StringIO(out)))
+            self.assertEqual(code, 0)
+            self.assertEqual(rows[0], ["set", "size_bytes", "path"])
+            self.assertEqual(len(rows) - 1, 4)
+            self.assertEqual({r[0] for r in rows[1:]}, {"1", "2"})
+            self.assertTrue(any(r[2].endswith("a,1.txt") for r in rows[1:]))
+            self.assertEqual({int(r[1]) for r in rows[1:]}, {12, 13})
+
+    def test_csv_and_json_conflict(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("dupes", ".", "--csv", "--json")
+
     def test_dupes_text_and_missing_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, out = self.run_cli("dupes", tmp)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -39,7 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignore files smaller than SIZE, e.g. 1M (default: 1 byte)")
     d.add_argument("-t", "--top", type=int, default=20,
                    help="show the N sets with the most reclaimable space (0 = all)")
-    d.add_argument("--json", action="store_true", help="machine-readable output")
+    fmt = d.add_mutually_exclusive_group()
+    fmt.add_argument("--json", action="store_true", help="machine-readable output")
+    fmt.add_argument("--csv", action="store_true",
+                     help="one row per file: set,size_bytes,path (all sets, ignores --top)")
     _add_common(d)
 
     u = sub.add_parser("usage", help="directory size tree")
@@ -89,13 +93,19 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
             print(f"dupedisk: not a directory: {path}", file=sys.stderr)
             return 2
     progress = None
-    if sys.stderr.isatty() and not args.json:
+    if sys.stderr.isatty() and not (args.json or args.csv):
         progress = lambda n: print(f"\rscanning... {n:,} files", end="", file=sys.stderr, flush=True)
     report = find_duplicates(args.paths, args.min_size, args.exclude, progress)
     if progress:
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
 
-    if args.json:
+    if args.csv:
+        writer = csv.writer(sys.stdout, lineterminator="\n")
+        writer.writerow(["set", "size_bytes", "path"])
+        for i, group in enumerate(report.groups, 1):
+            for path in group.paths:
+                writer.writerow([i, group.size, path])
+    elif args.json:
         print(json.dumps({
             "files_scanned": report.files_scanned,
             "bytes_scanned": report.bytes_scanned,

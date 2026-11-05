@@ -11,7 +11,7 @@ Python 3.10+.
 ## Usage
 
 ```
-python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--json] [-v]
+python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--json | --csv] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [-x PAT] [-v]
 ```
@@ -63,7 +63,7 @@ python -m unittest discover -s tests
 - [ ] hash cache between runs (path, size, mtime -> digest)
 - [ ] parallel hashing
 - [ ] `--similar-names` mode for `file (1).ext` style copies
-- [ ] CSV export
+- [x] CSV export (`dupes --csv`)
 - [ ] `usage --since 30d` to see what grew recently
 - [ ] PyPI release
 
