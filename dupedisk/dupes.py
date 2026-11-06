@@ -13,6 +13,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from .cache import HashCache
 from .walk import walk_files
 
 PARTIAL_BYTES = 64 * 1024
@@ -35,6 +36,9 @@ class DupeReport:
     files_scanned: int = 0
     bytes_scanned: int = 0
     errors: list[str] = field(default_factory=list)
+    cache_used: bool = False
+    cache_hits: int = 0
+    cache_misses: int = 0
 
     @property
     def reclaimable(self) -> int:
@@ -45,33 +49,50 @@ class DupeReport:
         return sum(len(g.paths) - 1 for g in self.groups)
 
 
-def _hash_file(path: str, limit: int | None, errors: list[str]) -> str | None:
+def _digest(path: str, limit: int | None) -> str:
     h = hashlib.blake2b(digest_size=20)
     remaining = limit
-    try:
-        with open(path, "rb") as fh:
-            while True:
-                want = CHUNK_BYTES if remaining is None else min(CHUNK_BYTES, remaining)
-                if want == 0:
-                    break
-                block = fh.read(want)
-                if not block:
-                    break
-                h.update(block)
-                if remaining is not None:
-                    remaining -= len(block)
-    except OSError as exc:
-        errors.append(f"{path}: {exc.strerror or exc}")
-        return None
+    with open(path, "rb") as fh:
+        while True:
+            want = CHUNK_BYTES if remaining is None else min(CHUNK_BYTES, remaining)
+            if want == 0:
+                break
+            block = fh.read(want)
+            if not block:
+                break
+            h.update(block)
+            if remaining is not None:
+                remaining -= len(block)
     return h.hexdigest()
 
 
+def _hash_file(
+    path: str, limit: int | None, errors: list[str], cache: HashCache | None = None
+) -> str | None:
+    kind = "full" if limit is None else f"head{limit}"  # the window size is part of the key
+    stamp: tuple[int, int] | None = None
+    try:
+        if cache is not None:
+            st = os.stat(path)
+            stamp = (st.st_size, st.st_mtime_ns)
+            cached = cache.get(path, kind, *stamp)
+            if cached is not None:
+                return cached
+        digest = _digest(path, limit)
+    except OSError as exc:
+        errors.append(f"{path}: {exc.strerror or exc}")
+        return None
+    if cache is not None and stamp is not None:
+        cache.put(path, kind, *stamp, digest)
+    return digest
+
+
 def _group_by_hash(
-    paths: Iterable[str], limit: int | None, errors: list[str]
+    paths: Iterable[str], limit: int | None, errors: list[str], cache: HashCache | None = None
 ) -> list[list[str]]:
     buckets: dict[str, list[str]] = defaultdict(list)
     for path in paths:
-        digest = _hash_file(path, limit, errors)
+        digest = _hash_file(path, limit, errors, cache)
         if digest is not None:
             buckets[digest].append(path)
     return [b for b in buckets.values() if len(b) > 1]
@@ -114,8 +135,9 @@ def find_duplicates(
     min_size: int = 1,
     excludes: Iterable[str] = (),
     progress: Callable[[int], None] | None = None,
+    cache: HashCache | None = None,
 ) -> DupeReport:
-    report = DupeReport()
+    report = DupeReport(cache_used=cache is not None)
     by_size: dict[int, list[str]] = defaultdict(list)
 
     for root in _prune_roots(roots):
@@ -133,12 +155,16 @@ def find_duplicates(
         paths = _collapse_hardlinks(paths, report.errors)
         if len(paths) < 2:
             continue
-        candidates = _group_by_hash(paths, PARTIAL_BYTES, report.errors)
+        candidates = _group_by_hash(paths, PARTIAL_BYTES, report.errors, cache)
         for bucket in candidates:
             # a file no bigger than the partial window is already fully hashed
-            confirmed = [bucket] if size <= PARTIAL_BYTES else _group_by_hash(bucket, None, report.errors)
+            confirmed = (
+                [bucket] if size <= PARTIAL_BYTES else _group_by_hash(bucket, None, report.errors, cache)
+            )
             for group in confirmed:
                 report.groups.append(DupeGroup(size, tuple(sorted(group))))
 
     report.groups.sort(key=lambda g: (-g.reclaimable, g.paths))
+    if cache is not None:
+        report.cache_hits, report.cache_misses = cache.hits, cache.misses
     return report

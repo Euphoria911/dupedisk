@@ -11,7 +11,7 @@ Python 3.10+.
 ## Usage
 
 ```
-python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--json | --csv] [-v]
+python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--cache FILE] [--json | --csv] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [-x PAT] [-v]
 ```
@@ -49,6 +49,15 @@ Group by size, then hash the first 64 KiB (BLAKE2b), then hash the whole file. O
 that collide at one stage are read for the next, so a big tree with few real duplicates
 stays cheap.
 
+## Cache
+
+`--cache hashes.db` stores each digest in SQLite, keyed by path and checked against the
+file's size and mtime. Re-runs only read files that changed. On the 14.5 GiB folder
+above with `-m 1M`: 69.5 s cold, 0.74 s warm.
+
+As with any stat-based cache, a file edited in place with the same size *and* the same
+mtime would be missed. Delete the cache file to force a full re-hash.
+
 ## Tests
 
 ```
@@ -60,7 +69,8 @@ python -m unittest discover -s tests
 - [ ] `--delete` with a dry-run default, keep-rule (`--keep oldest|newest|shortest-path`)
 - [ ] send to Recycle Bin instead of unlinking
 - [ ] replace duplicates with hard links
-- [ ] hash cache between runs (path, size, mtime -> digest)
+- [x] hash cache between runs (`dupes --cache FILE`)
+- [ ] `cache prune` to drop entries for files that no longer exist
 - [ ] parallel hashing
 - [ ] `--similar-names` mode for `file (1).ext` style copies
 - [x] CSV export (`dupes --csv`)

@@ -4,9 +4,11 @@ import argparse
 import csv
 import json
 import os
+import sqlite3
 import sys
 
 from . import __version__
+from .cache import HashCache
 from .dupes import DupeReport, find_duplicates
 from .sizes import human, parse_size
 from .usage import largest_files, render_tree, scan
@@ -40,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignore files smaller than SIZE, e.g. 1M (default: 1 byte)")
     d.add_argument("-t", "--top", type=int, default=20,
                    help="show the N sets with the most reclaimable space (0 = all)")
+    d.add_argument("--cache", metavar="FILE",
+                   help="SQLite hash cache; unchanged files (same size and mtime) are not re-read")
     fmt = d.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="machine-readable output")
     fmt.add_argument("--csv", action="store_true",
@@ -71,6 +75,8 @@ def _report_errors(errors: list[str], verbose: bool) -> None:
 
 def _print_dupes(report: DupeReport, top: int) -> None:
     print(f"scanned {report.files_scanned:,} files ({human(report.bytes_scanned)})")
+    if report.cache_used:
+        print(f"cache: {report.cache_hits:,} hits, {report.cache_misses:,} misses")
     if not report.groups:
         print("no duplicates found")
         return
@@ -95,7 +101,18 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
     progress = None
     if sys.stderr.isatty() and not (args.json or args.csv):
         progress = lambda n: print(f"\rscanning... {n:,} files", end="", file=sys.stderr, flush=True)
-    report = find_duplicates(args.paths, args.min_size, args.exclude, progress)
+    cache = None
+    if args.cache:
+        try:
+            cache = HashCache(args.cache)
+        except sqlite3.Error as exc:
+            print(f"dupedisk: cannot open cache {args.cache}: {exc}", file=sys.stderr)
+            return 2
+    try:
+        report = find_duplicates(args.paths, args.min_size, args.exclude, progress, cache)
+    finally:
+        if cache is not None:
+            cache.close()
     if progress:
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
 
@@ -106,13 +123,16 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
             for path in group.paths:
                 writer.writerow([i, group.size, path])
     elif args.json:
-        print(json.dumps({
+        payload = {
             "files_scanned": report.files_scanned,
             "bytes_scanned": report.bytes_scanned,
             "reclaimable": report.reclaimable,
             "groups": [{"size": g.size, "paths": list(g.paths)} for g in report.groups],
             "skipped": len(report.errors),
-        }, indent=2))
+        }
+        if report.cache_used:
+            payload["cache"] = {"hits": report.cache_hits, "misses": report.cache_misses}
+        print(json.dumps(payload, indent=2))
     else:
         _print_dupes(report, args.top)
     _report_errors(report.errors, args.verbose)

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dupedisk.cache import HashCache
 from dupedisk.cli import main
 from dupedisk.dupes import PARTIAL_BYTES, find_duplicates
 from dupedisk.sizes import human, parse_size
@@ -106,6 +107,55 @@ class DupeTests(unittest.TestCase):
         self.assertEqual([g.size for g in report.groups], [1000, 10])
 
 
+class CacheTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "data"
+        self.db = str(Path(self._tmp.name) / "cache.db")
+        write(self.root, "a.txt", b"same bytes")
+        write(self.root, "b.txt", b"same bytes")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def scan(self):
+        with HashCache(self.db) as cache:
+            return find_duplicates([str(self.root)], cache=cache)
+
+    def test_second_run_is_served_from_cache(self):
+        first = self.scan()
+        self.assertEqual((first.cache_hits, first.cache_misses), (0, 2))
+        second = self.scan()
+        self.assertEqual((second.cache_hits, second.cache_misses), (2, 0))
+        self.assertEqual(second.groups, first.groups)
+
+    def test_changed_file_is_rehashed(self):
+        self.scan()
+        target = self.root / "b.txt"
+        target.write_bytes(b"other byte")  # same size, new content
+        os.utime(target, ns=(1_000_000_000, 1_000_000_000))  # force a different mtime
+        report = self.scan()
+        self.assertEqual((report.cache_hits, report.cache_misses), (1, 1))
+        self.assertEqual(report.groups, [])
+
+    def test_large_files_cache_both_stages(self):
+        big = b"Z" * (PARTIAL_BYTES + 5)
+        write(self.root, "big1.bin", big)
+        write(self.root, "big2.bin", big)
+        first = self.scan()  # 2 small heads + 2 big heads + 2 big fulls
+        self.assertEqual(first.cache_misses, 6)
+        second = self.scan()
+        self.assertEqual((second.cache_hits, second.cache_misses), (6, 0))
+
+    def test_cache_survives_roundtrip_and_is_per_kind(self):
+        with HashCache(self.db) as cache:
+            cache.put("x", "full", 5, 7, "abc")
+            self.assertIsNone(cache.get("x", "head1", 5, 7))
+            self.assertIsNone(cache.get("x", "full", 5, 8))
+        with HashCache(self.db) as cache:
+            self.assertEqual(cache.get("x", "full", 5, 7), "abc")
+
+
 class UsageTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -182,6 +232,19 @@ class CliTests(unittest.TestCase):
             self.assertEqual({r[0] for r in rows[1:]}, {"1", "2"})
             self.assertTrue(any(r[2].endswith("a,1.txt") for r in rows[1:]))
             self.assertEqual({int(r[1]) for r in rows[1:]}, {12, 13})
+
+    def test_cli_cache_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "d"
+            write(root, "a", b"dupe-content")
+            write(root, "b", b"dupe-content")
+            db = os.path.join(tmp, "c.db")
+            _, out = self.run_cli("dupes", str(root), "--cache", db)
+            self.assertIn("cache: 0 hits, 2 misses", out)
+            _, out = self.run_cli("dupes", str(root), "--cache", db, "--json")
+            self.assertEqual(json.loads(out)["cache"], {"hits": 2, "misses": 0})
+            bad = os.path.join(tmp, "no", "such", "dir", "c.db")
+            self.assertEqual(self.run_cli("dupes", str(root), "--cache", bad)[0], 2)
 
     def test_csv_and_json_conflict(self):
         with self.assertRaises(SystemExit):
