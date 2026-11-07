@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("-t", "--top", type=int, default=15, help="entries per directory (0 = all)")
     _add_common(u)
 
+    c = sub.add_parser("cache", help="inspect or clean a hash cache created with dupes --cache")
+    c.add_argument("file", metavar="FILE")
+    c.add_argument("--prune", action="store_true",
+                   help="drop entries for files that are gone or changed since they were hashed")
+
     g = sub.add_parser("largest", help="biggest files under a path")
     g.add_argument("path", nargs="?", default=".")
     g.add_argument("-n", "--count", type=int, default=20)
@@ -150,6 +155,23 @@ def _cmd_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cache(args: argparse.Namespace) -> int:
+    if not os.path.isfile(args.file):
+        print(f"dupedisk: no such cache file: {args.file}", file=sys.stderr)
+        return 2
+    try:
+        with HashCache(args.file) as cache:
+            before = cache.count()
+            print(f"{args.file}: {before:,} entries, {human(os.path.getsize(args.file))}")
+            if args.prune:
+                removed = cache.prune()
+                print(f"pruned {removed:,} stale entries, {before - removed:,} remain")
+    except sqlite3.Error as exc:
+        print(f"dupedisk: not a usable cache ({exc})", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_largest(args: argparse.Namespace) -> int:
     if not os.path.isdir(args.path):
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
@@ -165,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")  # odd filenames must not crash a cp1252 console
     args = build_parser().parse_args(argv)
-    handler = {"dupes": _cmd_dupes, "usage": _cmd_usage, "largest": _cmd_largest}[args.command]
+    handler = {
+        "dupes": _cmd_dupes, "usage": _cmd_usage, "largest": _cmd_largest, "cache": _cmd_cache,
+    }[args.command]
     try:
         return handler(args)
     except KeyboardInterrupt:

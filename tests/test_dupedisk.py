@@ -147,6 +147,35 @@ class CacheTests(unittest.TestCase):
         second = self.scan()
         self.assertEqual((second.cache_hits, second.cache_misses), (6, 0))
 
+    def test_prune_drops_missing_and_changed_files(self):
+        big = b"Z" * (PARTIAL_BYTES + 5)
+        write(self.root, "big1.bin", big)
+        write(self.root, "big2.bin", big)
+        self.scan()  # a, b: 1 entry each; big1, big2: 2 entries each (head + full)
+        (self.root / "a.txt").unlink()  # gone: 1 entry
+        target = self.root / "big2.bin"
+        target.write_bytes(b"Y" * (PARTIAL_BYTES + 5))  # changed: 2 entries
+        os.utime(target, ns=(1_000_000_000, 1_000_000_000))
+        with HashCache(self.db) as cache:
+            self.assertEqual(cache.count(), 6)
+            self.assertEqual(cache.prune(), 3)
+            self.assertEqual(cache.count(), 3)
+            self.assertEqual(cache.prune(), 0)
+
+    def test_cli_cache_command(self):
+        self.scan()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["cache", self.db]), 0)
+            self.assertEqual(main(["cache", self.db, "--prune"]), 0)
+        self.assertIn("2 entries", out.getvalue())
+        self.assertIn("pruned 0 stale entries, 2 remain", out.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["cache", self.db + ".missing"]), 2)
+            junk = Path(self._tmp.name) / "junk.db"
+            junk.write_bytes(b"this is not sqlite at all" * 50)
+            self.assertEqual(main(["cache", str(junk)]), 2)
+
     def test_cache_survives_roundtrip_and_is_per_kind(self):
         with HashCache(self.db) as cache:
             cache.put("x", "full", 5, 7, "abc")

@@ -55,6 +55,11 @@ stays cheap.
 file's size and mtime. Re-runs only read files that changed. On the 14.5 GiB folder
 above with `-m 1M`: 69.5 s cold, 0.74 s warm.
 
+```
+python -m dupedisk cache hashes.db            # entry count and file size
+python -m dupedisk cache hashes.db --prune    # drop entries for files that are gone or changed
+```
+
 As with any stat-based cache, a file edited in place with the same size *and* the same
 mtime would be missed. Delete the cache file to force a full re-hash.
 
@@ -70,7 +75,7 @@ python -m unittest discover -s tests
 - [ ] send to Recycle Bin instead of unlinking
 - [ ] replace duplicates with hard links
 - [x] hash cache between runs (`dupes --cache FILE`)
-- [ ] `cache prune` to drop entries for files that no longer exist
+- [x] `cache --prune` to drop entries for files that are gone or changed
 - [ ] parallel hashing
 - [ ] `--similar-names` mode for `file (1).ext` style copies
 - [x] CSV export (`dupes --csv`)

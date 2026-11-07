@@ -17,12 +17,16 @@ _COMMIT_EVERY = 500
 class HashCache:
     def __init__(self, path: str) -> None:
         self._db = sqlite3.connect(path)
-        self._db.execute(
-            "CREATE TABLE IF NOT EXISTS hashes ("
-            " path TEXT NOT NULL, kind TEXT NOT NULL,"
-            " size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, digest TEXT NOT NULL,"
-            " PRIMARY KEY (path, kind))"
-        )
+        try:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS hashes ("
+                " path TEXT NOT NULL, kind TEXT NOT NULL,"
+                " size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, digest TEXT NOT NULL,"
+                " PRIMARY KEY (path, kind))"
+            )
+        except sqlite3.Error:
+            self._db.close()  # a non-database file must not leave its handle open
+            raise
         self.hits = 0
         self.misses = 0
         self._pending = 0
@@ -51,6 +55,33 @@ class HashCache:
         if self._pending >= _COMMIT_EVERY:
             self._db.commit()
             self._pending = 0
+
+    def count(self) -> int:
+        return self._db.execute("SELECT COUNT(*) FROM hashes").fetchone()[0]
+
+    def prune(self) -> int:
+        """Delete entries whose file is gone or no longer matches its recorded size/mtime.
+
+        Returns how many entries were removed, then compacts the database file.
+        """
+        rows = self._db.execute("SELECT path, kind, size, mtime_ns FROM hashes").fetchall()
+        stamps: dict[str, tuple[int, int] | None] = {}
+        stale = []
+        for path, kind, size, mtime_ns in rows:
+            if path not in stamps:
+                try:
+                    st = os.stat(path)
+                    stamps[path] = (st.st_size, st.st_mtime_ns)
+                except OSError:
+                    stamps[path] = None
+            if stamps[path] != (size, mtime_ns):
+                stale.append((path, kind))
+        self._db.executemany("DELETE FROM hashes WHERE path = ? AND kind = ?", stale)
+        self._db.commit()
+        self._pending = 0
+        if stale:
+            self._db.execute("VACUUM")
+        return len(stale)
 
     def close(self) -> None:
         self._db.commit()
