@@ -9,7 +9,7 @@ from pathlib import Path
 from dupedisk.cache import HashCache
 from dupedisk.cli import main
 from dupedisk.dupes import PARTIAL_BYTES, find_duplicates
-from dupedisk.sizes import human, parse_size
+from dupedisk.sizes import human, parse_age, parse_size
 from dupedisk.usage import largest_files, render_tree, scan
 
 
@@ -34,6 +34,17 @@ class SizeTests(unittest.TestCase):
         self.assertEqual(parse_size("2GiB"), 2 * 1024**3)
         with self.assertRaises(ValueError):
             parse_size("ten")
+
+    def test_parse_age(self):
+        self.assertEqual(parse_age("90s"), 90)
+        self.assertEqual(parse_age("30m"), 1800)
+        self.assertEqual(parse_age("12h"), 12 * 3600)
+        self.assertEqual(parse_age("30d"), 30 * 86400)
+        self.assertEqual(parse_age("2W"), 14 * 86400)
+        self.assertEqual(parse_age("1.5d"), 1.5 * 86400)
+        for bad in ("30", "d", "-5d", "3 months", ""):
+            with self.assertRaises(ValueError):
+                parse_age(bad)
 
 
 class DupeTests(unittest.TestCase):
@@ -225,6 +236,39 @@ class UsageTests(unittest.TestCase):
         files = largest_files(str(self.root), count=2)
         self.assertEqual([Path(f.path).name for f in files], ["a.bin", "b.bin"])
 
+    def age_files(self, days_old: dict[str, float]) -> float:
+        """Backdate files; returns a cutoff 10 days ago."""
+        now = os.path.getmtime(self.root / "top.bin")
+        for rel, days in days_old.items():
+            stamp = now - days * 86400
+            os.utime(self.root / rel, (stamp, stamp))
+        return now - 10 * 86400
+
+    def test_modified_after_counts_only_recent_files(self):
+        cutoff = self.age_files({"big/a.bin": 30, "small/c.bin": 30})
+        node = scan(str(self.root), max_depth=2, modified_after=cutoff)
+        self.assertEqual(node.size, 2500)  # b.bin (2000) + top.bin (500)
+        self.assertEqual(node.files, 2)
+        self.assertEqual([c.name for c in node.children], ["big", "top.bin"])
+        big = node.children[0]
+        self.assertEqual(big.size, 2000)
+        self.assertEqual([c.name for c in big.children], ["deep"])
+
+    def test_modified_after_drops_directories_with_nothing_recent(self):
+        cutoff = self.age_files({"small/c.bin": 30})
+        names = [c.name for c in scan(str(self.root), 2, modified_after=cutoff).children]
+        self.assertNotIn("small", names)
+        # without the filter the same directory is still there
+        self.assertIn("small", [c.name for c in scan(str(self.root), 2).children])
+
+    def test_modified_after_future_cutoff_is_empty(self):
+        node = scan(str(self.root), 2, modified_after=os.path.getmtime(self.root / "top.bin") + 3600)
+        self.assertEqual((node.size, node.files, node.children), (0, 0, []))
+
+    def test_render_note(self):
+        text = render_tree(scan(str(self.root), 1), note="modified in the last 30d")
+        self.assertIn("in 4 files modified in the last 30d", text.splitlines()[0])
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, *argv):
@@ -294,6 +338,25 @@ class CliTests(unittest.TestCase):
             self.assertIn("f.bin", out)
             code, out = self.run_cli("largest", tmp, "-n", "1")
             self.assertIn("2.0 KiB", out)
+
+    def test_usage_since(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = write(Path(tmp), "old.bin", b"x" * 4096)
+            write(Path(tmp), "new.bin", b"x" * 1024)
+            stamp = old.stat().st_mtime - 60 * 86400
+            os.utime(old, (stamp, stamp))
+            code, out = self.run_cli("usage", tmp, "--since", "30d")
+            self.assertEqual(code, 0)
+            self.assertIn("modified in the last 30d", out)
+            self.assertIn("in 1 files", out)
+            self.assertIn("new.bin", out)
+            self.assertNotIn("old.bin", out)
+            _, out = self.run_cli("usage", tmp, "--since", "90d")
+            self.assertIn("old.bin", out)
+
+    def test_usage_since_rejects_bad_age(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("usage", ".", "--since", "30")
 
 
 if __name__ == "__main__":

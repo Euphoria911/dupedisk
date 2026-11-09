@@ -6,17 +6,27 @@ import json
 import os
 import sqlite3
 import sys
+import time
 
 from . import __version__
 from .cache import HashCache
 from .dupes import DupeReport, find_duplicates
-from .sizes import human, parse_size
+from .sizes import human, parse_age, parse_size
 from .usage import largest_files, render_tree, scan
 
 
 def _size_arg(text: str) -> int:
     try:
         return parse_size(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _age_arg(text: str) -> str:
+    """Validate at parse time, keep the text so the report can echo it back."""
+    try:
+        parse_age(text)
+        return text.strip()
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
@@ -54,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("path", nargs="?", default=".")
     u.add_argument("-d", "--depth", type=int, default=2, help="levels to show (default 2)")
     u.add_argument("-t", "--top", type=int, default=15, help="entries per directory (0 = all)")
+    u.add_argument("--since", type=_age_arg, metavar="AGE",
+                   help="count only files modified within AGE, e.g. 30d, 12h, 2w")
     _add_common(u)
 
     c = sub.add_parser("cache", help="inspect or clean a hash cache created with dupes --cache")
@@ -149,8 +161,10 @@ def _cmd_usage(args: argparse.Namespace) -> int:
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
         return 2
     errors: list[str] = []
-    root = scan(args.path, args.depth, args.exclude, errors)
-    sys.stdout.write(render_tree(root, args.top))
+    cutoff = None if args.since is None else time.time() - parse_age(args.since)
+    root = scan(args.path, args.depth, args.exclude, errors, cutoff)
+    note = f"modified in the last {args.since}" if args.since is not None else ""
+    sys.stdout.write(render_tree(root, args.top, note=note))
     _report_errors(errors, args.verbose)
     return 0
 

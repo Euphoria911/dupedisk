@@ -26,15 +26,26 @@ def scan(
     max_depth: int = 2,
     excludes: Iterable[str] = (),
     errors: list[str] | None = None,
+    modified_after: float | None = None,
 ) -> Node:
-    """Total every directory under ``root``; only nodes within ``max_depth`` are kept."""
+    """Total every directory under ``root``; only nodes within ``max_depth`` are kept.
+
+    ``modified_after`` is an epoch time: older files are not counted at all, and directories
+    left with no files are dropped, so the tree shows only what changed since then.
+    """
     errors = errors if errors is not None else []
     root = os.path.abspath(root)
-    return _scan(root, root, 0, max_depth, tuple(excludes), errors)
+    return _scan(root, root, 0, max_depth, tuple(excludes), errors, modified_after)
 
 
 def _scan(
-    path: str, name: str, depth: int, max_depth: int, excludes: tuple[str, ...], errors: list[str]
+    path: str,
+    name: str,
+    depth: int,
+    max_depth: int,
+    excludes: tuple[str, ...],
+    errors: list[str],
+    modified_after: float | None,
 ) -> Node:
     node = Node(name, path)
     keep = depth < max_depth
@@ -49,25 +60,33 @@ def _scan(
                 if is_link(entry) or is_excluded(entry, excludes):
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    child = _scan(entry.path, entry.name, depth + 1, max_depth, excludes, errors)
+                    child = _scan(
+                        entry.path, entry.name, depth + 1, max_depth, excludes, errors, modified_after
+                    )
+                    if modified_after is not None and child.files == 0:
+                        continue
                     node.size += child.size
                     node.files += child.files
                     if keep:
                         node.children.append(child)
                 elif entry.is_file(follow_symlinks=False):
-                    size = entry.stat(follow_symlinks=False).st_size
-                    node.size += size
+                    st = entry.stat(follow_symlinks=False)
+                    if modified_after is not None and st.st_mtime < modified_after:
+                        continue
+                    node.size += st.st_size
                     node.files += 1
                     if keep:
-                        node.children.append(Node(entry.name, entry.path, size, False, 1))
+                        node.children.append(Node(entry.name, entry.path, st.st_size, False, 1))
             except OSError as exc:
                 errors.append(f"{entry.path}: {exc.strerror or exc}")
     node.children.sort(key=lambda n: (-n.size, n.name.lower()))
     return node
 
 
-def render_tree(root: Node, top: int = 15, bar_width: int = 20) -> str:
-    lines = [f"{root.path}  -  {human(root.size)} in {root.files:,} files", ""]
+def render_tree(root: Node, top: int = 15, bar_width: int = 20, note: str = "") -> str:
+    """``note`` is appended to the header line, e.g. ``modified in the last 30d``."""
+    header = f"{root.path}  -  {human(root.size)} in {root.files:,} files"
+    lines = [f"{header} {note}" if note else header, ""]
     _render_children(root, top, bar_width, 0, lines)
     return "\n".join(lines) + "\n"
 

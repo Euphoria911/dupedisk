@@ -12,7 +12,7 @@ Python 3.10+.
 
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--cache FILE] [--json | --csv] [-v]
-python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [-x PAT] [-v]
+python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [-x PAT] [-v]
 ```
 
@@ -39,6 +39,10 @@ C:\Users\me\projects  -  14.5 GiB in 39,561 files
   73.7 MiB                                ... 3 more
 ```
 
+- `--since 30d`: `usage` counts only files modified in the last 30 days (`s`, `m`, `h`, `d`,
+  `w`), so you see what grew instead of what is merely big. Directories with nothing recent
+  are dropped. It goes by modification time, so a file that was copied in with an old
+  timestamp won't show up.
 - `-m 10M`: ignore files under 10 MiB (units are binary: K, M, G, T).
 - `-x PAT`: skip names or paths matching a glob, e.g. `-x node_modules -x "*.tmp"`.
 - Overlapping roots are merged, so `dupes C:\a C:\a\b` doesn't double-count.
@@ -79,7 +83,7 @@ python -m unittest discover -s tests
 - [ ] parallel hashing
 - [ ] `--similar-names` mode for `file (1).ext` style copies
 - [x] CSV export (`dupes --csv`)
-- [ ] `usage --since 30d` to see what grew recently
+- [x] `usage --since 30d` to see what changed recently
 - [ ] PyPI release
 
 ## License
