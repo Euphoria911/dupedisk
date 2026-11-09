@@ -12,6 +12,7 @@ Python 3.10+.
 
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--cache FILE] [--json | --csv] [-v]
+python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [-x PAT] [-v]
 ```
@@ -47,6 +48,29 @@ C:\Users\me\projects  -  14.5 GiB in 39,561 files
 - `-x PAT`: skip names or paths matching a glob, e.g. `-x node_modules -x "*.tmp"`.
 - Overlapping roots are merged, so `dupes C:\a C:\a\b` doesn't double-count.
 
+## Copies by name
+
+`similar` finds the `report (1).pdf` / `report - Copy.pdf` / `Copy of report.pdf` files that
+browsers and Explorer leave behind, and checks each one against its original byte for byte.
+
+```
+$ python -m dupedisk similar C:\Users\me\Downloads
+scanned 8,213 files
+3 copies of 3 originals, 2 identical, 50.3 KiB reclaimable
+
+[1] C:\Users\me\Downloads\notes.docx  (44.1 KiB)
+    identical            C:\Users\me\Downloads\notes (1).docx
+[2] C:\Users\me\Downloads\build.zip  (23.8 KiB)
+    differs, 25.2 KiB    C:\Users\me\Downloads\build (1).zip
+```
+
+- A copy only counts if its original is in the **same folder** with the same extension. A lone
+  `photo (1).jpg` is just a name.
+- `differs` means the copy was edited or is a newer download: look before you delete it.
+- A hard link to the original is skipped, since it costs no space.
+- `--identical` lists only the copies that are safe to drop. `dupes` finds identical files
+  under any name; `similar` also finds the near-misses.
+
 ## How it works
 
 Group by size, then hash the first 64 KiB (BLAKE2b), then hash the whole file. Only files
@@ -81,7 +105,7 @@ python -m unittest discover -s tests
 - [x] hash cache between runs (`dupes --cache FILE`)
 - [x] `cache --prune` to drop entries for files that are gone or changed
 - [ ] parallel hashing
-- [ ] `--similar-names` mode for `file (1).ext` style copies
+- [x] `similar` command for `file (1).ext` style copies
 - [x] CSV export (`dupes --csv`)
 - [x] `usage --since 30d` to see what changed recently
 - [ ] PyPI release

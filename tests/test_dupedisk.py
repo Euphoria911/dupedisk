@@ -9,6 +9,7 @@ from pathlib import Path
 from dupedisk.cache import HashCache
 from dupedisk.cli import main
 from dupedisk.dupes import PARTIAL_BYTES, find_duplicates
+from dupedisk.similar import find_similar_names, original_stem
 from dupedisk.sizes import human, parse_age, parse_size
 from dupedisk.usage import largest_files, render_tree, scan
 
@@ -116,6 +117,78 @@ class DupeTests(unittest.TestCase):
         write(self.root, "b2", b"b" * 1000)
         report = find_duplicates([str(self.root)])
         self.assertEqual([g.size for g in report.groups], [1000, 10])
+
+
+class SimilarTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_original_stem(self):
+        self.assertEqual(original_stem("report (1)"), "report")
+        self.assertEqual(original_stem("report - Copy"), "report")
+        self.assertEqual(original_stem("report - Copy (3)"), "report")
+        self.assertEqual(original_stem("report copy 2"), "report")
+        self.assertEqual(original_stem("report_copy"), "report")
+        self.assertEqual(original_stem("Copy of report"), "report")
+        self.assertEqual(original_stem("Copy (2) of report"), "report")
+        self.assertEqual(original_stem("a (1) (2)"), "a (1)")
+        for plain in ("report", "report (final)", "copyright", "photocopy", "(1)", "version 2"):
+            self.assertIsNone(original_stem(plain), plain)
+
+    def test_identical_and_edited_copies(self):
+        write(self.root, "doc.txt", b"original text")
+        write(self.root, "doc (1).txt", b"original text")
+        write(self.root, "doc - Copy.txt", b"edited text!!")
+        write(self.root, "doc copy.txt", b"edited")  # different size, different content
+        report = find_similar_names([str(self.root)])
+        self.assertEqual(len(report.sets), 1)
+        s = report.sets[0]
+        self.assertEqual(Path(s.original).name, "doc.txt")
+        verdicts = {Path(c.path).name: c.identical for c in s.copies}
+        self.assertEqual(
+            verdicts, {"doc (1).txt": True, "doc - Copy.txt": False, "doc copy.txt": False}
+        )
+        self.assertEqual(s.reclaimable, len(b"original text"))
+        self.assertEqual((report.copy_count, report.identical_count), (3, 1))
+
+    def test_needs_an_original_in_the_same_folder_and_extension(self):
+        write(self.root, "lonely (1).jpg", b"x")
+        write(self.root, "a/pic.jpg", b"x")
+        write(self.root, "b/pic (1).jpg", b"x")  # original is in another folder
+        write(self.root, "c/note.txt", b"x")
+        write(self.root, "c/note (1).md", b"x")  # same stem, other extension
+        self.assertEqual(find_similar_names([str(self.root)]).sets, [])
+
+    def test_case_insensitive_match(self):
+        write(self.root, "Report.PDF", b"same")
+        write(self.root, "report (1).pdf", b"same")
+        self.assertEqual(len(find_similar_names([str(self.root)]).sets), 1)
+
+    def test_hard_link_to_original_is_not_a_copy(self):
+        write(self.root, "f.bin", b"data")
+        try:
+            os.link(self.root / "f.bin", self.root / "f (1).bin")
+        except OSError:
+            self.skipTest("hard links unavailable")
+        self.assertEqual(find_similar_names([str(self.root)]).sets, [])
+
+    def test_min_size_and_excludes(self):
+        write(self.root, "k.bin", b"x" * 10)
+        write(self.root, "k (1).bin", b"x" * 10)
+        self.assertEqual(find_similar_names([str(self.root)], min_size=11).sets, [])
+        self.assertEqual(find_similar_names([str(self.root)], excludes=["* (1).bin"]).sets, [])
+
+    def test_sorted_by_reclaimable(self):
+        write(self.root, "small.txt", b"s" * 5)
+        write(self.root, "small (1).txt", b"s" * 5)
+        write(self.root, "big.txt", b"b" * 500)
+        write(self.root, "big (1).txt", b"b" * 500)
+        names = [Path(s.original).name for s in find_similar_names([str(self.root)]).sets]
+        self.assertEqual(names, ["big.txt", "small.txt"])
 
 
 class CacheTests(unittest.TestCase):
@@ -338,6 +411,34 @@ class CliTests(unittest.TestCase):
             self.assertIn("f.bin", out)
             code, out = self.run_cli("largest", tmp, "-n", "1")
             self.assertIn("2.0 KiB", out)
+
+    def test_similar_text_json_and_identical_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "a.txt", b"same-bytes")
+            write(root, "a (1).txt", b"same-bytes")
+            write(root, "b.txt", b"first")
+            write(root, "b (1).txt", b"other!")
+            code, out = self.run_cli("similar", tmp)
+            self.assertEqual(code, 0)
+            self.assertIn("2 copies of 2 originals, 1 identical", out)
+            self.assertIn("identical", out)
+            self.assertIn("differs, 6 B", out)
+            code, out = self.run_cli("similar", tmp, "--identical")
+            self.assertIn("1 copies of 1 originals", out)
+            self.assertNotIn("differs", out)
+            self.assertNotIn("b (1).txt", out)
+            _, out = self.run_cli("similar", tmp, "--json")
+            data = json.loads(out)
+            self.assertEqual(len(data["sets"]), 2)
+            self.assertEqual(data["reclaimable"], len(b"same-bytes"))
+            self.assertEqual(self.run_cli("similar", os.path.join(tmp, "nope"))[0], 2)
+
+    def test_similar_nothing_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "x.txt", b"x")
+            _, out = self.run_cli("similar", tmp)
+            self.assertIn("no copy-style names found", out)
 
     def test_usage_since(self):
         with tempfile.TemporaryDirectory() as tmp:

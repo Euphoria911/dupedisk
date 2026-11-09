@@ -11,8 +11,11 @@ import time
 from . import __version__
 from .cache import HashCache
 from .dupes import DupeReport, find_duplicates
+from .similar import CopySet, find_similar_names
 from .sizes import human, parse_age, parse_size
 from .usage import largest_files, render_tree, scan
+
+_TAG_WIDTH = len("differs, 1023.9 MiB")  # widest tag, so paths line up
 
 
 def _size_arg(text: str) -> int:
@@ -59,6 +62,19 @@ def build_parser() -> argparse.ArgumentParser:
     fmt.add_argument("--csv", action="store_true",
                      help="one row per file: set,size_bytes,path (all sets, ignores --top)")
     _add_common(d)
+
+    s = sub.add_parser(
+        "similar", help="find 'name (1).ext' style copies next to their original (report only)"
+    )
+    s.add_argument("paths", nargs="+", metavar="PATH")
+    s.add_argument("-m", "--min-size", type=_size_arg, default=1, metavar="SIZE",
+                   help="ignore copies smaller than SIZE (default: 1 byte)")
+    s.add_argument("-t", "--top", type=int, default=20,
+                   help="show the N originals with the most reclaimable space (0 = all)")
+    s.add_argument("--identical", action="store_true",
+                   help="only list copies that are byte-for-byte equal to their original")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    _add_common(s)
 
     u = sub.add_parser("usage", help="directory size tree")
     u.add_argument("path", nargs="?", default=".")
@@ -156,6 +172,57 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_similar(args: argparse.Namespace) -> int:
+    for path in args.paths:
+        if not os.path.isdir(path):
+            print(f"dupedisk: not a directory: {path}", file=sys.stderr)
+            return 2
+    report = find_similar_names(args.paths, args.min_size, args.exclude)
+    sets = report.sets
+    if args.identical:
+        sets = [
+            CopySet(s.original, s.size, tuple(c for c in s.copies if c.identical))
+            for s in sets
+            if s.reclaimable
+        ]
+    copies = sum(len(s.copies) for s in sets)
+
+    if args.json:
+        payload = {
+            "files_scanned": report.files_scanned,
+            "reclaimable": report.reclaimable,
+            "sets": [
+                {
+                    "original": s.original,
+                    "size": s.size,
+                    "copies": [{"path": c.path, "size": c.size, "identical": c.identical} for c in s.copies],
+                }
+                for s in sets
+            ],
+            "skipped": len(report.errors),
+        }
+        print(json.dumps(payload, indent=2))
+    elif not sets:
+        print(f"scanned {report.files_scanned:,} files")
+        print("no copy-style names found" if not args.identical else "no identical copies found")
+    else:
+        print(f"scanned {report.files_scanned:,} files")
+        print(
+            f"{copies:,} copies of {len(sets):,} originals, "
+            f"{report.identical_count:,} identical, {human(report.reclaimable)} reclaimable\n"
+        )
+        shown = sets[: args.top] if args.top > 0 else sets
+        for i, s in enumerate(shown, 1):
+            print(f"[{i}] {s.original}  ({human(s.size)})")
+            for c in s.copies:
+                tag = "identical" if c.identical else f"differs, {human(c.size)}"
+                print(f"    {tag:<{_TAG_WIDTH}}  {c.path}")
+        if len(shown) < len(sets):
+            print(f"\n... {len(sets) - len(shown)} more originals (--top 0 for all)")
+    _report_errors(report.errors, args.verbose)
+    return 0
+
+
 def _cmd_usage(args: argparse.Namespace) -> int:
     if not os.path.isdir(args.path):
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
@@ -202,7 +269,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")  # odd filenames must not crash a cp1252 console
     args = build_parser().parse_args(argv)
     handler = {
-        "dupes": _cmd_dupes, "usage": _cmd_usage, "largest": _cmd_largest, "cache": _cmd_cache,
+        "dupes": _cmd_dupes, "similar": _cmd_similar, "usage": _cmd_usage,
+        "largest": _cmd_largest, "cache": _cmd_cache,
     }[args.command]
     try:
         return handler(args)
