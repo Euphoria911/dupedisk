@@ -25,6 +25,16 @@ def _size_arg(text: str) -> int:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def _jobs_arg(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"invalid job count: {text!r} (use 0 for one per CPU)")
+    return n or os.cpu_count() or 1
+
+
 def _age_arg(text: str) -> str:
     """Validate at parse time, keep the text so the report can echo it back."""
     try:
@@ -55,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignore files smaller than SIZE, e.g. 1M (default: 1 byte)")
     d.add_argument("-t", "--top", type=int, default=20,
                    help="show the N sets with the most reclaimable space (0 = all)")
+    d.add_argument("-j", "--jobs", type=_jobs_arg, default=1, metavar="N",
+                   help="hash N files at once (0 = one per CPU; default 1, best on SSDs)")
     d.add_argument("--cache", metavar="FILE",
                    help="SQLite hash cache; unchanged files (same size and mtime) are not re-read")
     fmt = d.add_mutually_exclusive_group()
@@ -142,7 +154,7 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
             print(f"dupedisk: cannot open cache {args.cache}: {exc}", file=sys.stderr)
             return 2
     try:
-        report = find_duplicates(args.paths, args.min_size, args.exclude, progress, cache)
+        report = find_duplicates(args.paths, args.min_size, args.exclude, progress, cache, args.jobs)
     finally:
         if cache is not None:
             cache.close()

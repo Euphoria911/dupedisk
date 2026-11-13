@@ -11,6 +11,7 @@ import hashlib
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .cache import HashCache
@@ -66,35 +67,72 @@ def _digest(path: str, limit: int | None) -> str:
     return h.hexdigest()
 
 
-def _hash_file(
-    path: str, limit: int | None, errors: list[str], cache: HashCache | None = None
-) -> str | None:
-    kind = "full" if limit is None else f"head{limit}"  # the window size is part of the key
-    stamp: tuple[int, int] | None = None
+def _try_digest(path: str, limit: int | None) -> tuple[str | None, OSError | None]:
     try:
+        return _digest(path, limit), None
+    except OSError as exc:
+        return None, exc
+
+
+def _hash_many(
+    paths: Iterable[str],
+    limit: int | None,
+    errors: list[str],
+    cache: HashCache | None = None,
+    jobs: int = 1,
+) -> dict[str, str]:
+    """Digest every path (the first ``limit`` bytes, or the whole file); unreadable ones are
+    recorded in ``errors`` and left out.
+
+    The cache (one SQLite connection, so main thread only) is read before and written after;
+    only the files it can't answer go to the thread pool. Results come back in input order,
+    so the output does not depend on ``jobs``.
+    """
+    kind = "full" if limit is None else f"head{limit}"  # the window size is part of the key
+    digests: dict[str, str] = {}
+    todo: list[tuple[str, tuple[int, int] | None]] = []
+    for path in paths:
+        stamp: tuple[int, int] | None = None
         if cache is not None:
-            st = os.stat(path)
+            try:
+                st = os.stat(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc.strerror or exc}")
+                continue
             stamp = (st.st_size, st.st_mtime_ns)
             cached = cache.get(path, kind, *stamp)
             if cached is not None:
-                return cached
-        digest = _digest(path, limit)
-    except OSError as exc:
-        errors.append(f"{path}: {exc.strerror or exc}")
-        return None
-    if cache is not None and stamp is not None:
-        cache.put(path, kind, *stamp, digest)
-    return digest
+                digests[path] = cached
+                continue
+        todo.append((path, stamp))
+
+    paths_to_read = [path for path, _ in todo]
+    if jobs > 1 and len(todo) > 1:
+        # hashlib drops the GIL on large buffers, so threads scale on SSDs and cached reads
+        pool = ThreadPoolExecutor(max_workers=jobs)
+        try:
+            results = list(pool.map(lambda p: _try_digest(p, limit), paths_to_read))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)  # Ctrl-C must not wait out the queue
+    else:
+        results = [_try_digest(p, limit) for p in paths_to_read]
+
+    for (path, stamp), (digest, exc) in zip(todo, results):
+        if exc is not None or digest is None:
+            errors.append(f"{path}: {(exc.strerror or exc) if exc else 'unreadable'}")
+            continue
+        digests[path] = digest
+        if cache is not None and stamp is not None:
+            cache.put(path, kind, *stamp, digest)
+    return digests
 
 
-def _group_by_hash(
-    paths: Iterable[str], limit: int | None, errors: list[str], cache: HashCache | None = None
-) -> list[list[str]]:
+def _split_by_digest(paths: list[str], digests: dict[str, str]) -> list[list[str]]:
+    """Bucket ``paths`` by digest; keep only buckets that still hold two or more files."""
     buckets: dict[str, list[str]] = defaultdict(list)
     for path in paths:
-        digest = _hash_file(path, limit, errors, cache)
-        if digest is not None:
-            buckets[digest].append(path)
+        if path in digests:
+            buckets[digests[path]].append(path)
     return [b for b in buckets.values() if len(b) > 1]
 
 
@@ -136,7 +174,9 @@ def find_duplicates(
     excludes: Iterable[str] = (),
     progress: Callable[[int], None] | None = None,
     cache: HashCache | None = None,
+    jobs: int = 1,
 ) -> DupeReport:
+    """``jobs`` > 1 hashes that many files at once. The result is the same for any value."""
     report = DupeReport(cache_used=cache is not None)
     by_size: dict[int, list[str]] = defaultdict(list)
 
@@ -149,20 +189,28 @@ def find_duplicates(
             if progress and report.files_scanned % 2000 == 0:
                 progress(report.files_scanned)
 
+    sized: list[tuple[int, list[str]]] = []
     for size, paths in by_size.items():
         if len(paths) < 2:
             continue
         paths = _collapse_hardlinks(paths, report.errors)
-        if len(paths) < 2:
-            continue
-        candidates = _group_by_hash(paths, PARTIAL_BYTES, report.errors, cache)
-        for bucket in candidates:
-            # a file no bigger than the partial window is already fully hashed
-            confirmed = (
-                [bucket] if size <= PARTIAL_BYTES else _group_by_hash(bucket, None, report.errors, cache)
-            )
-            for group in confirmed:
-                report.groups.append(DupeGroup(size, tuple(sorted(group))))
+        if len(paths) >= 2:
+            sized.append((size, paths))
+
+    # Hash every candidate of a stage in one batch: size groups are usually just 2-3 files,
+    # so a pool per group would sit idle. A stage only reads files that survived the last one.
+    heads = _hash_many((p for _, ps in sized for p in ps), PARTIAL_BYTES, report.errors, cache, jobs)
+    partial = [(size, b) for size, ps in sized for b in _split_by_digest(ps, heads)]
+
+    # a file no bigger than the partial window is already fully hashed
+    confirmed = [(size, b) for size, b in partial if size <= PARTIAL_BYTES]
+    large = [(size, b) for size, b in partial if size > PARTIAL_BYTES]
+    full = _hash_many((p for _, b in large for p in b), None, report.errors, cache, jobs)
+    for size, bucket in large:
+        confirmed.extend((size, g) for g in _split_by_digest(bucket, full))
+
+    for size, group in confirmed:
+        report.groups.append(DupeGroup(size, tuple(sorted(group))))
 
     report.groups.sort(key=lambda g: (-g.reclaimable, g.paths))
     if cache is not None:

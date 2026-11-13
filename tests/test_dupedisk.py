@@ -110,6 +110,64 @@ class DupeTests(unittest.TestCase):
         self.assertEqual(len(report.groups), 1)
         self.assertEqual(len(report.groups[0].paths), 2)
 
+    def build_mixed_tree(self):
+        big = b"A" * (PARTIAL_BYTES + 10)
+        for i in range(6):  # six identical big files, three near-misses sharing their head
+            write(self.root, f"big/same{i}.bin", big + b"1")
+        for i in range(3):
+            write(self.root, f"big/near{i}.bin", big + bytes([50 + i]))
+        for i in range(8):  # small sets of 2-3
+            for j in range(2 + i % 2):
+                write(self.root, f"small{i}/f{j}.txt", f"content-{i}".encode() * 3)
+        write(self.root, "lone.txt", b"nobody else is this size, really")
+
+    def test_jobs_give_the_same_result_as_serial(self):
+        self.build_mixed_tree()
+        serial = find_duplicates([str(self.root)], jobs=1)
+        for jobs in (2, 4, 16):
+            report = find_duplicates([str(self.root)], jobs=jobs)
+            self.assertEqual(report.groups, serial.groups, jobs)
+            self.assertEqual(report.errors, [])
+        self.assertEqual(len(serial.groups), 9)  # 1 big set + 8 small sets
+        self.assertEqual(max(len(g.paths) for g in serial.groups), 6)
+
+    def test_jobs_with_cache_counts_and_reuse(self):
+        self.build_mixed_tree()
+        db = str(self.root.parent / (self.root.name + ".db"))
+        try:
+            with HashCache(db) as cache:
+                cold = find_duplicates([str(self.root)], cache=cache, jobs=4)
+            with HashCache(db) as cache:
+                warm = find_duplicates([str(self.root)], cache=cache, jobs=4)
+            self.assertEqual(cold.groups, warm.groups)
+            self.assertEqual(cold.cache_hits, 0)
+            self.assertGreater(cold.cache_misses, 0)
+            self.assertEqual(warm.cache_misses, 0)
+            self.assertEqual(warm.cache_hits, cold.cache_misses)
+        finally:
+            if os.path.exists(db):
+                os.remove(db)
+
+    def test_unreadable_file_is_recorded_and_the_rest_still_hash(self):
+        from unittest import mock
+
+        from dupedisk import dupes
+
+        self.build_mixed_tree()
+        real = dupes._digest
+
+        def flaky(path, limit):
+            if path.endswith("same0.bin"):
+                raise PermissionError(13, "Permission denied")
+            return real(path, limit)
+
+        with mock.patch.object(dupes, "_digest", flaky):
+            report = find_duplicates([str(self.root)], jobs=4)
+        self.assertEqual(len(report.errors), 1)
+        self.assertIn("same0.bin", report.errors[0])
+        big = max(report.groups, key=lambda g: len(g.paths))
+        self.assertEqual(len(big.paths), 5)  # same1..same5; same0 dropped, near* told apart
+
     def test_groups_sorted_by_reclaimable(self):
         write(self.root, "s1", b"a" * 10)
         write(self.root, "s2", b"a" * 10)
@@ -391,6 +449,19 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads(out)["cache"], {"hits": 2, "misses": 0})
             bad = os.path.join(tmp, "no", "such", "dir", "c.db")
             self.assertEqual(self.run_cli("dupes", str(root), "--cache", bad)[0], 2)
+
+    def test_jobs_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "a", b"dupe-content")
+            write(Path(tmp), "b", b"dupe-content")
+            reference = json.loads(self.run_cli("dupes", tmp, "--json")[1])["groups"]
+            for jobs in ("1", "4", "0"):
+                code, out = self.run_cli("dupes", tmp, "-j", jobs, "--json")
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(out)["groups"], reference)
+            for bad in ("-1", "many", "1.5"):
+                with self.assertRaises(SystemExit):
+                    self.run_cli("dupes", tmp, "--jobs", bad)
 
     def test_csv_and_json_conflict(self):
         with self.assertRaises(SystemExit):

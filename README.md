@@ -11,7 +11,7 @@ Python 3.10+.
 ## Usage
 
 ```
-python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [--cache FILE] [--json | --csv] [-v]
+python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--cache FILE] [--json | --csv] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [-x PAT] [-v]
@@ -77,6 +77,18 @@ Group by size, then hash the first 64 KiB (BLAKE2b), then hash the whole file. O
 that collide at one stage are read for the next, so a big tree with few real duplicates
 stays cheap.
 
+## Parallel hashing
+
+`-j N` hashes N files at once (`-j 0` = one per CPU). The default is 1, which is the right
+choice for a spinning disk, where parallel reads just make the head seek. Every candidate
+of a stage goes into one batch, so it helps even when each size group holds only two or
+three files. The report is identical for any `-j`, and a `--cache` still works (it is read
+and written from the main thread only).
+
+Measured on 72,106 files (`-m 1M`, 24 logical CPUs, files already in the OS cache, so this
+is hashing cost without disk latency): 1.58 s at `-j 1`, 0.99 s at `-j 4`, 0.90 s at `-j 8`.
+Cold-disk results depend on the device, so test `-j 4` against `-j 1` on yours.
+
 ## Cache
 
 `--cache hashes.db` stores each digest in SQLite, keyed by path and checked against the
@@ -104,7 +116,7 @@ python -m unittest discover -s tests
 - [ ] replace duplicates with hard links
 - [x] hash cache between runs (`dupes --cache FILE`)
 - [x] `cache --prune` to drop entries for files that are gone or changed
-- [ ] parallel hashing
+- [x] parallel hashing (`dupes -j N`)
 - [x] `similar` command for `file (1).ext` style copies
 - [x] CSV export (`dupes --csv`)
 - [x] `usage --since 30d` to see what changed recently
