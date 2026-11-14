@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dupedisk.cache import HashCache
 from dupedisk.cli import main
-from dupedisk.dupes import PARTIAL_BYTES, find_duplicates
+from dupedisk.dupes import PARTIAL_BYTES, against_reference, find_duplicates, is_within
 from dupedisk.similar import find_similar_names, original_stem
 from dupedisk.sizes import human, parse_age, parse_size
 from dupedisk.usage import largest_files, node_to_dict, render_tree, scan
@@ -109,6 +109,61 @@ class DupeTests(unittest.TestCase):
         self.assertEqual(report.files_scanned, 2)
         self.assertEqual(len(report.groups), 1)
         self.assertEqual(len(report.groups[0].paths), 2)
+
+    def build_reference_tree(self):
+        write(self.root, "archive/a.txt", b"alpha-content")
+        write(self.root, "archive/b.txt", b"bravo-content!")
+        write(self.root, "archive/c1.txt", b"charlie-content")
+        write(self.root, "archive/c2.txt", b"charlie-content")  # duplicated inside the reference
+        write(self.root, "archive/solo.txt", b"only in the archive")
+        write(self.root, "inbox/a_copy.txt", b"alpha-content")
+        write(self.root, "inbox/b.txt", b"bravo-content!")
+        write(self.root, "inbox/c.txt", b"charlie-content")
+        write(self.root, "inbox/new.txt", b"brand new file")
+        write(self.root, "inbox/x1.txt", b"twice, outside only")  # duplicated, but not in the archive
+        write(self.root, "inbox/x2.txt", b"twice, outside only")
+
+    def test_is_within(self):
+        base = str(self.root / "archive")
+        self.assertTrue(is_within(base, base))
+        self.assertTrue(is_within(str(self.root / "archive" / "a" / "b.txt"), base))
+        self.assertTrue(is_within(str(self.root / "archive" / "x"), base + os.sep))
+        self.assertFalse(is_within(str(self.root / "archive2" / "a.txt"), base))  # shared prefix only
+        self.assertFalse(is_within(str(self.root), base))
+
+    def test_against_reference_keeps_only_sets_that_straddle_it(self):
+        self.build_reference_tree()
+        archive = str(self.root / "archive")
+        report = find_duplicates([str(self.root / "inbox"), archive])
+        self.assertEqual(len(report.groups), 4)  # a, b, c, and the outside-only x pair
+        groups = against_reference(report.groups, archive)
+        names = {tuple(sorted(Path(p).name for p in g.paths)) for g in groups}
+        self.assertEqual(
+            names,
+            {("a.txt", "a_copy.txt"), ("b.txt", "b.txt"), ("c.txt", "c1.txt", "c2.txt")},
+        )
+        by_size = {g.size: g for g in groups}
+        c = by_size[len(b"charlie-content")]
+        self.assertEqual(len(c.keep), 2)
+        self.assertEqual([Path(p).parent.name for p in c.extras], ["inbox"])
+        self.assertEqual(c.reclaimable, len(b"charlie-content"))  # one outside copy, not two
+        self.assertTrue(all(is_within(p, archive) for g in groups for p in g.keep))
+        self.assertTrue(all(not is_within(p, archive) for g in groups for p in g.extras))
+        report.groups = groups
+        self.assertEqual(report.redundant_files, 3)
+
+    def test_against_reference_with_nothing_to_report(self):
+        write(self.root, "archive/a.txt", b"one")
+        write(self.root, "inbox/b.txt", b"two")
+        report = find_duplicates([str(self.root / "inbox"), str(self.root / "archive")])
+        self.assertEqual(against_reference(report.groups, str(self.root / "archive")), [])
+
+    def test_plain_groups_still_reclaim_all_but_one(self):
+        write(self.root, "a", b"same!")
+        write(self.root, "b", b"same!")
+        write(self.root, "c", b"same!")
+        (group,) = find_duplicates([str(self.root)]).groups
+        self.assertEqual((group.keep, group.reclaimable), ((), 2 * len(b"same!")))
 
     def build_mixed_tree(self):
         big = b"A" * (PARTIAL_BYTES + 10)
@@ -466,6 +521,52 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads(out)["cache"], {"hits": 2, "misses": 0})
             bad = os.path.join(tmp, "no", "such", "dir", "c.db")
             self.assertEqual(self.run_cli("dupes", str(root), "--cache", bad)[0], 2)
+
+    def test_against_text_json_and_csv(self):
+        import csv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "archive/a.txt", b"alpha-content")
+            write(root, "inbox/a_copy.txt", b"alpha-content")
+            write(root, "inbox/new.txt", b"brand new file")
+            inbox, archive = str(root / "inbox"), str(root / "archive")
+
+            code, out = self.run_cli("dupes", inbox, "--against", archive)
+            self.assertEqual(code, 0)
+            self.assertIn("reference (kept):", out)
+            self.assertIn("1 duplicate sets, 1 redundant files", out)
+            self.assertRegex(out, r"keep  .*a\.txt")
+            self.assertRegex(out, r"dupe  .*a_copy\.txt")
+
+            data = json.loads(self.run_cli("dupes", inbox, "--against", archive, "--json")[1])
+            self.assertEqual(data["against"], archive)
+            self.assertEqual(data["reclaimable"], len(b"alpha-content"))
+            (group,) = data["groups"]
+            self.assertEqual([Path(p).name for p in group["keep"]], ["a.txt"])
+
+            rows = list(csv.reader(io.StringIO(self.run_cli("dupes", inbox, "--against", archive, "--csv")[1])))
+            self.assertEqual(rows[0], ["set", "size_bytes", "path", "role"])
+            self.assertEqual({(Path(r[2]).name, r[3]) for r in rows[1:]},
+                             {("a.txt", "keep"), ("a_copy.txt", "dupe")})
+
+            plain = json.loads(self.run_cli("dupes", inbox, archive, "--json")[1])
+            self.assertNotIn("against", plain)
+            self.assertNotIn("keep", plain["groups"][0])  # output without --against is unchanged
+
+    def test_against_errors_and_empty_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "archive/a.txt", b"one")
+            write(root, "archive/sub/b.txt", b"two")
+            write(root, "inbox/c.txt", b"three")
+            inbox, archive = str(root / "inbox"), str(root / "archive")
+            self.assertEqual(self.run_cli("dupes", inbox, "--against", str(root / "nope"))[0], 2)
+            self.assertEqual(self.run_cli("dupes", str(root / "archive" / "sub"), "--against", archive)[0], 2)
+            self.assertEqual(self.run_cli("dupes", archive, "--against", archive)[0], 2)
+            code, out = self.run_cli("dupes", inbox, "--against", archive)
+            self.assertEqual(code, 0)
+            self.assertIn("nothing outside the reference is duplicated in it", out)
 
     def test_jobs_flag(self):
         with tempfile.TemporaryDirectory() as tmp:

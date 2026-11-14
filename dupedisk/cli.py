@@ -10,7 +10,7 @@ import time
 
 from . import __version__
 from .cache import HashCache
-from .dupes import DupeReport, find_duplicates
+from .dupes import DupeReport, against_reference, find_duplicates, is_within
 from .similar import CopySet, find_similar_names
 from .sizes import human, parse_age, parse_size
 from .usage import largest_files, node_to_dict, render_tree, scan
@@ -76,12 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="show the N sets with the most reclaimable space (0 = all)")
     d.add_argument("-j", "--jobs", type=_jobs_arg, default=1, metavar="N",
                    help="hash N files at once (0 = one per CPU; default 1, best on SSDs)")
+    d.add_argument("--against", metavar="DIR",
+                   help="treat DIR as the copies to keep: report only files outside it that "
+                        "already exist inside it")
     d.add_argument("--cache", metavar="FILE",
                    help="SQLite hash cache; unchanged files (same size and mtime) are not re-read")
     fmt = d.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="machine-readable output")
     fmt.add_argument("--csv", action="store_true",
-                     help="one row per file: set,size_bytes,path (all sets, ignores --top)")
+                     help="one row per file: set,size_bytes,path (all sets, ignores --top); "
+                          "with --against a role column says keep or dupe")
     _add_common(d)
 
     s = sub.add_parser(
@@ -130,12 +134,14 @@ def _report_errors(errors: list[str], verbose: bool) -> None:
         print(f"{len(errors)} path(s) skipped (-v to list)", file=sys.stderr)
 
 
-def _print_dupes(report: DupeReport, top: int) -> None:
+def _print_dupes(report: DupeReport, top: int, against: str | None = None) -> None:
     print(f"scanned {report.files_scanned:,} files ({human(report.bytes_scanned)})")
+    if against:
+        print(f"reference (kept): {os.path.abspath(against)}")
     if report.cache_used:
         print(f"cache: {report.cache_hits:,} hits, {report.cache_misses:,} misses")
     if not report.groups:
-        print("no duplicates found")
+        print("nothing outside the reference is duplicated in it" if against else "no duplicates found")
         return
     print(
         f"{len(report.groups):,} duplicate sets, {report.redundant_files:,} redundant files, "
@@ -145,16 +151,25 @@ def _print_dupes(report: DupeReport, top: int) -> None:
     for i, group in enumerate(shown, 1):
         print(f"[{i}] {len(group.paths)} x {human(group.size)}  ({human(group.reclaimable)} reclaimable)")
         for path in group.paths:
-            print(f"    {path}")
+            if group.keep:  # --against: say which copies stay
+                print(f"    {'keep' if path in group.keep else 'dupe'}  {path}")
+            else:
+                print(f"    {path}")
     if len(shown) < len(report.groups):
         print(f"\n... {len(report.groups) - len(shown)} more sets (--top 0 for all)")
 
 
 def _cmd_dupes(args: argparse.Namespace) -> int:
-    for path in args.paths:
+    for path in args.paths + ([args.against] if args.against else []):
         if not os.path.isdir(path):
             print(f"dupedisk: not a directory: {path}", file=sys.stderr)
             return 2
+    if args.against:
+        for path in args.paths:
+            if is_within(path, args.against):
+                print(f"dupedisk: {path} is inside --against {args.against}; "
+                      "nothing outside the reference to compare", file=sys.stderr)
+                return 2
     progress = None
     if sys.stderr.isatty() and not (args.json or args.csv):
         progress = lambda n: print(f"\rscanning... {n:,} files", end="", file=sys.stderr, flush=True)
@@ -166,32 +181,43 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
             print(f"dupedisk: cannot open cache {args.cache}: {exc}", file=sys.stderr)
             return 2
     try:
-        report = find_duplicates(args.paths, args.min_size, args.exclude, progress, cache, args.jobs)
+        roots = args.paths + ([args.against] if args.against else [])
+        report = find_duplicates(roots, args.min_size, args.exclude, progress, cache, args.jobs)
     finally:
         if cache is not None:
             cache.close()
     if progress:
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+    if args.against:
+        report.groups = against_reference(report.groups, args.against)
 
     if args.csv:
         writer = csv.writer(sys.stdout, lineterminator="\n")
-        writer.writerow(["set", "size_bytes", "path"])
+        writer.writerow(["set", "size_bytes", "path"] + (["role"] if args.against else []))
         for i, group in enumerate(report.groups, 1):
             for path in group.paths:
-                writer.writerow([i, group.size, path])
+                row = [i, group.size, path]
+                if args.against:
+                    row.append("keep" if path in group.keep else "dupe")
+                writer.writerow(row)
     elif args.json:
         payload = {
             "files_scanned": report.files_scanned,
             "bytes_scanned": report.bytes_scanned,
             "reclaimable": report.reclaimable,
-            "groups": [{"size": g.size, "paths": list(g.paths)} for g in report.groups],
+            "groups": [
+                {"size": g.size, "paths": list(g.paths), **({"keep": list(g.keep)} if g.keep else {})}
+                for g in report.groups
+            ],
             "skipped": len(report.errors),
         }
+        if args.against:
+            payload["against"] = args.against
         if report.cache_used:
             payload["cache"] = {"hits": report.cache_hits, "misses": report.cache_misses}
         print(json.dumps(payload, indent=2))
     else:
-        _print_dupes(report, args.top)
+        _print_dupes(report, args.top, args.against)
     _report_errors(report.errors, args.verbose)
     return 0
 

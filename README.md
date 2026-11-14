@@ -11,7 +11,7 @@ Python 3.10+.
 ## Usage
 
 ```
-python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--cache FILE] [--json | --csv] [-v]
+python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against DIR] [--cache FILE] [--json | --csv] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
@@ -50,6 +50,30 @@ C:\Users\me\projects  -  14.5 GiB in 39,561 files
 - `-m 10M`: ignore files under 10 MiB (units are binary: K, M, G, T).
 - `-x PAT`: skip names or paths matching a glob, e.g. `-x node_modules -x "*.tmp"`.
 - Overlapping roots are merged, so `dupes C:\a C:\a\b` doesn't double-count.
+
+## Against a reference folder
+
+`--against DIR` answers "which of these files do I already have in my archive?". DIR is the
+copies you keep, and PATH is what you're cleaning up:
+
+```
+$ python -m dupedisk dupes C:\Users\me\Downloads --against C:\Users\me\Documents -m 1K
+scanned 11,772 files (5.3 GiB)
+reference (kept): C:\Users\me\Documents
+1 duplicate sets, 1 redundant files, 4.7 KiB reclaimable
+
+[1] 2 x 4.7 KiB  (4.7 KiB reclaimable)
+    keep  C:\Users\me\Documents\cookielogger.cpp
+    dupe  C:\Users\me\Downloads\cookielogger.cpp
+```
+
+- Only sets with a copy inside DIR **and** one outside it are listed. Duplicates that sit
+  entirely inside DIR, or entirely outside it, are left to plain `dupes`.
+- Reclaimable space counts the copies outside DIR only, so a file stored twice in the archive
+  doesn't make its one download look like two.
+- A PATH inside DIR is an error: there would be nothing outside the reference to compare.
+- `--json` adds `against` and a `keep` list per set. `--csv` adds a `role` column (`keep` or
+  `dupe`). Without `--against` the output is unchanged.
 
 ## Copies by name
 

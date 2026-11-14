@@ -25,10 +25,18 @@ CHUNK_BYTES = 1024 * 1024
 class DupeGroup:
     size: int
     paths: tuple[str, ...]
+    keep: tuple[str, ...] = ()  # with --against: the copies inside the reference folder
+
+    @property
+    def extras(self) -> tuple[str, ...]:
+        """The copies that are redundant: all but one, or everything outside the reference."""
+        if self.keep:
+            return tuple(p for p in self.paths if p not in self.keep)
+        return self.paths[1:]
 
     @property
     def reclaimable(self) -> int:
-        return self.size * (len(self.paths) - 1)
+        return self.size * len(self.extras)
 
 
 @dataclass
@@ -47,7 +55,7 @@ class DupeReport:
 
     @property
     def redundant_files(self) -> int:
-        return sum(len(g.paths) - 1 for g in self.groups)
+        return sum(len(g.extras) for g in self.groups)
 
 
 def _digest(path: str, limit: int | None) -> str:
@@ -166,6 +174,27 @@ def _prune_roots(roots: Iterable[str]) -> list[str]:
         ):
             kept.append(root)
     return kept
+
+
+def is_within(path: str, root: str) -> bool:
+    """True if ``path`` is ``root`` or lies under it (case-insensitive on Windows)."""
+    key, base = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(root))
+    return key == base or key.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def against_reference(groups: Iterable[DupeGroup], reference: str) -> list[DupeGroup]:
+    """Keep only sets that have a copy inside ``reference`` and a copy outside it.
+
+    The copies inside become ``keep``; the ones outside are what's reclaimable. Sets that
+    live entirely inside or entirely outside the reference are dropped.
+    """
+    out = []
+    for group in groups:
+        inside = tuple(p for p in group.paths if is_within(p, reference))
+        if inside and len(inside) < len(group.paths):
+            out.append(DupeGroup(group.size, group.paths, inside))
+    out.sort(key=lambda g: (-g.reclaimable, g.paths))
+    return out
 
 
 def find_duplicates(
