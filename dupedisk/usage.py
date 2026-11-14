@@ -106,10 +106,27 @@ def _render_children(node: Node, top: int, bar_width: int, level: int, out: list
         out.append(f"{human(rest_size):>10}  {'':5}   {'':<{bar_width}}  {pad}... {len(rest)} more")
 
 
+def node_to_dict(node: Node) -> dict:
+    """The whole kept tree as plain data, for ``usage --json``."""
+    out: dict = {
+        "name": node.name,
+        "path": node.path,
+        "type": "dir" if node.is_dir else "file",
+        "size": node.size,
+        "files": node.files,
+    }
+    if node.is_dir:
+        out["children"] = [node_to_dict(child) for child in node.children]
+    return out
+
+
 def largest_files(
-    root: str, count: int = 20, excludes: Iterable[str] = (), errors: list[str] | None = None
+    root: str,
+    count: int = 20,
+    excludes: Iterable[str] = (),
+    errors: list[str] | None = None,
+    modified_after: float | None = None,
 ) -> list[FileInfo]:
     errors = errors if errors is not None else []
-    return heapq.nlargest(
-        count, walk_files(os.path.abspath(root), excludes, errors), key=lambda f: f.size
-    )
+    files = walk_files(os.path.abspath(root), excludes, errors, modified_after)
+    return heapq.nlargest(count, files, key=lambda f: f.size)

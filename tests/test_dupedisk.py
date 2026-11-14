@@ -11,7 +11,7 @@ from dupedisk.cli import main
 from dupedisk.dupes import PARTIAL_BYTES, find_duplicates
 from dupedisk.similar import find_similar_names, original_stem
 from dupedisk.sizes import human, parse_age, parse_size
-from dupedisk.usage import largest_files, render_tree, scan
+from dupedisk.usage import largest_files, node_to_dict, render_tree, scan
 
 
 def write(root: Path, rel: str, data: bytes) -> Path:
@@ -396,6 +396,23 @@ class UsageTests(unittest.TestCase):
         node = scan(str(self.root), 2, modified_after=os.path.getmtime(self.root / "top.bin") + 3600)
         self.assertEqual((node.size, node.files, node.children), (0, 0, []))
 
+    def test_largest_modified_after(self):
+        cutoff = self.age_files({"big/a.bin": 30})
+        names = [Path(f.path).name for f in largest_files(str(self.root), 10, modified_after=cutoff)]
+        self.assertEqual(names, ["b.bin", "top.bin", "c.bin"])  # a.bin (3000 B) is too old
+        self.assertEqual(len(largest_files(str(self.root), 10)), 4)
+
+    def test_node_to_dict(self):
+        data = node_to_dict(scan(str(self.root), max_depth=2))
+        self.assertEqual((data["type"], data["size"], data["files"]), ("dir", 5510, 4))
+        self.assertEqual([c["name"] for c in data["children"]], ["big", "top.bin", "small"])
+        big = data["children"][0]
+        self.assertEqual([c["name"] for c in big["children"]], ["a.bin", "deep"])
+        leaf = big["children"][0]
+        self.assertEqual((leaf["type"], leaf["size"]), ("file", 3000))
+        self.assertNotIn("children", leaf)
+        json.dumps(data)  # plain data only
+
     def test_render_note(self):
         text = render_tree(scan(str(self.root), 1), note="modified in the last 30d")
         self.assertIn("in 4 files modified in the last 30d", text.splitlines()[0])
@@ -525,6 +542,45 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("old.bin", out)
             _, out = self.run_cli("usage", tmp, "--since", "90d")
             self.assertIn("old.bin", out)
+
+    def test_usage_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "d/a.bin", b"x" * 100)
+            write(Path(tmp), "b.bin", b"x" * 40)
+            code, out = self.run_cli("usage", tmp, "--json", "-t", "1")  # --top is ignored
+            data = json.loads(out)
+            self.assertEqual(code, 0)
+            self.assertIsNone(data["since"])
+            self.assertEqual(data["tree"]["size"], 140)
+            self.assertEqual([c["name"] for c in data["tree"]["children"]], ["d", "b.bin"])
+            self.assertEqual(data["skipped"], 0)
+
+    def test_usage_json_with_since(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = write(Path(tmp), "old.bin", b"x" * 100)
+            write(Path(tmp), "new.bin", b"x" * 40)
+            stamp = old.stat().st_mtime - 90 * 86400
+            os.utime(old, (stamp, stamp))
+            data = json.loads(self.run_cli("usage", tmp, "--json", "--since", "7d")[1])
+            self.assertEqual(data["since"], "7d")
+            self.assertEqual(data["tree"]["size"], 40)
+
+    def test_largest_json_and_since(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = write(Path(tmp), "old.bin", b"x" * 500)
+            write(Path(tmp), "new.bin", b"x" * 40)
+            stamp = old.stat().st_mtime - 90 * 86400
+            os.utime(old, (stamp, stamp))
+            data = json.loads(self.run_cli("largest", tmp, "--json")[1])
+            self.assertEqual([f["size"] for f in data["files"]], [500, 40])
+            data = json.loads(self.run_cli("largest", tmp, "--json", "--since", "7d")[1])
+            self.assertEqual(data["since"], "7d")
+            self.assertEqual([f["size"] for f in data["files"]], [40])
+            _, text = self.run_cli("largest", tmp, "--since", "7d")
+            self.assertIn("new.bin", text)
+            self.assertNotIn("old.bin", text)
+            with self.assertRaises(SystemExit):
+                self.run_cli("largest", tmp, "--since", "7")
 
     def test_usage_since_rejects_bad_age(self):
         with self.assertRaises(SystemExit):

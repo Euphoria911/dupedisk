@@ -13,8 +13,8 @@ Python 3.10+.
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--cache FILE] [--json | --csv] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
-python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [-x PAT] [-v]
-python -m dupedisk largest [PATH]  [-n COUNT] [-x PAT] [-v]
+python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
+python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
 ```
 
 ```
@@ -40,10 +40,13 @@ C:\Users\me\projects  -  14.5 GiB in 39,561 files
   73.7 MiB                                ... 3 more
 ```
 
-- `--since 30d`: `usage` counts only files modified in the last 30 days (`s`, `m`, `h`, `d`,
-  `w`), so you see what grew instead of what is merely big. Directories with nothing recent
-  are dropped. It goes by modification time, so a file that was copied in with an old
-  timestamp won't show up.
+- `--since 30d`: `usage` and `largest` count only files modified in the last 30 days (`s`,
+  `m`, `h`, `d`, `w`), so you see what grew instead of what is merely big. Directories with
+  nothing recent are dropped. It goes by modification time, so a file that was copied in
+  with an old timestamp won't show up.
+- `--json` on `usage` and `largest` (as on `dupes` and `similar`) for scripts. `usage --json`
+  is the whole kept tree, nested as `children`, and ignores `--top`; `-d` still sets how
+  deep it goes.
 - `-m 10M`: ignore files under 10 MiB (units are binary: K, M, G, T).
 - `-x PAT`: skip names or paths matching a glob, e.g. `-x node_modules -x "*.tmp"`.
 - Overlapping roots are merged, so `dupes C:\a C:\a\b` doesn't double-count.

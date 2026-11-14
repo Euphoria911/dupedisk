@@ -27,7 +27,11 @@ def is_link(entry: os.DirEntry) -> bool:
     return bool(is_junction and is_junction())
 
 
-def walk_files(root: str, excludes: Iterable[str], errors: list[str]) -> Iterator[FileInfo]:
+def walk_files(
+    root: str, excludes: Iterable[str], errors: list[str], modified_after: float | None = None
+) -> Iterator[FileInfo]:
+    """Yield every regular file under ``root``; with ``modified_after`` (epoch seconds),
+    only files modified at or after that moment."""
     excludes = tuple(excludes)
     stack = [root]
     while stack:
@@ -45,6 +49,8 @@ def walk_files(root: str, excludes: Iterable[str], errors: list[str]) -> Iterato
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(entry.path)
                     elif entry.is_file(follow_symlinks=False):
-                        yield FileInfo(entry.path, entry.stat(follow_symlinks=False).st_size)
+                        st = entry.stat(follow_symlinks=False)
+                        if modified_after is None or st.st_mtime >= modified_after:
+                            yield FileInfo(entry.path, st.st_size)
                 except OSError as exc:
                     errors.append(f"{entry.path}: {exc.strerror or exc}")

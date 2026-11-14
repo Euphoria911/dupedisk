@@ -13,7 +13,7 @@ from .cache import HashCache
 from .dupes import DupeReport, find_duplicates
 from .similar import CopySet, find_similar_names
 from .sizes import human, parse_age, parse_size
-from .usage import largest_files, render_tree, scan
+from .usage import largest_files, node_to_dict, render_tree, scan
 
 _TAG_WIDTH = len("differs, 1023.9 MiB")  # widest tag, so paths line up
 
@@ -42,6 +42,15 @@ def _age_arg(text: str) -> str:
         return text.strip()
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _add_since(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--since", type=_age_arg, metavar="AGE",
+                   help="count only files modified within AGE, e.g. 30d, 12h, 2w")
+
+
+def _cutoff(args: argparse.Namespace) -> float | None:
+    return None if args.since is None else time.time() - parse_age(args.since)
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -92,8 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("path", nargs="?", default=".")
     u.add_argument("-d", "--depth", type=int, default=2, help="levels to show (default 2)")
     u.add_argument("-t", "--top", type=int, default=15, help="entries per directory (0 = all)")
-    u.add_argument("--since", type=_age_arg, metavar="AGE",
-                   help="count only files modified within AGE, e.g. 30d, 12h, 2w")
+    _add_since(u)
+    u.add_argument("--json", action="store_true",
+                   help="the whole tree as JSON (ignores --top)")
     _add_common(u)
 
     c = sub.add_parser("cache", help="inspect or clean a hash cache created with dupes --cache")
@@ -104,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("largest", help="biggest files under a path")
     g.add_argument("path", nargs="?", default=".")
     g.add_argument("-n", "--count", type=int, default=20)
+    _add_since(g)
+    g.add_argument("--json", action="store_true", help="machine-readable output")
     _add_common(g)
     return p
 
@@ -240,10 +252,13 @@ def _cmd_usage(args: argparse.Namespace) -> int:
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
         return 2
     errors: list[str] = []
-    cutoff = None if args.since is None else time.time() - parse_age(args.since)
-    root = scan(args.path, args.depth, args.exclude, errors, cutoff)
-    note = f"modified in the last {args.since}" if args.since is not None else ""
-    sys.stdout.write(render_tree(root, args.top, note=note))
+    root = scan(args.path, args.depth, args.exclude, errors, _cutoff(args))
+    if args.json:
+        payload = {"since": args.since, "tree": node_to_dict(root), "skipped": len(errors)}
+        print(json.dumps(payload, indent=2))
+    else:
+        note = f"modified in the last {args.since}" if args.since is not None else ""
+        sys.stdout.write(render_tree(root, args.top, note=note))
     _report_errors(errors, args.verbose)
     return 0
 
@@ -270,8 +285,17 @@ def _cmd_largest(args: argparse.Namespace) -> int:
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
         return 2
     errors: list[str] = []
-    for info in largest_files(args.path, args.count, args.exclude, errors):
-        print(f"{human(info.size):>10}  {info.path}")
+    files = largest_files(args.path, args.count, args.exclude, errors, _cutoff(args))
+    if args.json:
+        payload = {
+            "since": args.since,
+            "files": [{"path": f.path, "size": f.size} for f in files],
+            "skipped": len(errors),
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        for info in files:
+            print(f"{human(info.size):>10}  {info.path}")
     _report_errors(errors, args.verbose)
     return 0
 
