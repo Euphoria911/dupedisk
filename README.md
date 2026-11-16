@@ -14,6 +14,7 @@ Python 3.10+.
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against DIR] [--cache FILE] [--json | --csv] [-v]
 python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--hardlink | --move-to DIR] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
+python -m dupedisk restore DIR_OR_MANIFEST [-i PAT] [--apply] [-t N] [--json] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
@@ -137,6 +138,36 @@ manifest: D:\dupe-trash\dedupe-manifest.jsonl
   quarantine under the scanned tree would show its own contents as duplicates next time.
   `--move-to` and `--hardlink` are alternatives. A dry run creates nothing.
 
+### Undoing a `--move-to`
+
+```
+$ python -m dupedisk restore D:\dupe-trash                  # list what would go back
+would restore 145 files, 0 left in the quarantine
+    C:\Users\me\Downloads\x64\Debug\maps\de_boulder.opt
+...
+dry run: nothing was moved. Re-run with --apply to put these files back.
+
+$ python -m dupedisk restore D:\dupe-trash --apply          # do it
+$ python -m dupedisk restore D:\dupe-trash -i "*.opt" --apply   # only some of them
+```
+
+`restore` replays the manifest and moves every file still in the quarantine back to its
+original path, creating missing folders and keeping the modification time. Like `dedupe`, it
+is a dry run until you add `--apply`. It accepts the quarantine folder or the manifest file,
+and `-i PAT` (glob, or a substring) limits it to matching original paths.
+
+- **It never overwrites.** If something exists at the original path again, that file stays
+  and the quarantined copy stays too, reported as `left in quarantine: PATH (why)`. A file
+  that is no longer in the quarantine is skipped the same way. Either one makes `--apply`
+  exit with status 1.
+- Each restored file gets a `restored` line in the manifest and the quarantine folders it
+  leaves empty are removed (the manifest stays), so a second run reports `nothing to restore`.
+- Manifest entries hold paths relative to the quarantine folder, so you can move or rename
+  the whole folder and `restore` still finds everything. A stored path that points outside
+  the folder is refused, and unreadable manifest lines are counted and ignored.
+- If the same path was quarantined twice, the older move is restored and the newer one is
+  left in the quarantine until the path is free again.
+
 A file that fails a check is left alone and listed on stderr as `left alone: PATH (why)`, the
 rest of the plan still runs, and the exit status is 1. Nothing is ever force-deleted: a
 read-only file that Windows refuses to remove is reported, not chmod'ed. Deletion is
@@ -208,7 +239,7 @@ python -m unittest discover -s tests
 
 - [x] `dedupe`: dry run by default, `--apply` to delete, keep rules, re-verified per file
 - [x] quarantine folder instead of unlinking (`dedupe --move-to DIR`)
-- [ ] `restore` command to put quarantined files back
+- [x] `restore` command to put quarantined files back
 - [x] replace duplicates with hard links (`dedupe --hardlink`)
 - [x] hash cache between runs (`dupes --cache FILE`)
 - [x] `cache --prune` to drop entries for files that are gone or changed

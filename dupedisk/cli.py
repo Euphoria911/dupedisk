@@ -12,7 +12,7 @@ from . import __version__
 from .cache import HashCache
 from .dedupe import RULES, Plan, apply_plans, plan_against, plan_by_rule
 from .dupes import DupeReport, against_reference, find_duplicates, is_within
-from .quarantine import Quarantine
+from .quarantine import Quarantine, manifest_path_for, restore
 from .similar import CopySet, find_similar_names
 from .sizes import human, parse_age, parse_size
 from .usage import largest_files, node_to_dict, render_tree, scan
@@ -107,8 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="instead of deleting, replace each extra copy with a hard link to the kept "
                         "copy: every path stays, the space is freed (same volume, NTFS/ext4/...)")
     r.add_argument("--move-to", metavar="DIR",
-                   help="instead of deleting, move each extra copy into DIR, with a manifest of "
-                        "where every file came from; must be outside the scanned folders")
+                   help="instead of deleting, move each extra copy into DIR (undo with "
+                        "`dupedisk restore DIR`); must be outside the scanned folders")
     r.add_argument("--apply", action="store_true",
                    help="actually do it; without it this only prints what would happen")
     r.add_argument("-t", "--top", type=int, default=20,
@@ -116,6 +116,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "limits the printout only, --apply acts on every set")
     r.add_argument("--json", action="store_true", help="machine-readable plan and result")
     _add_common(r)
+
+    u2 = sub.add_parser(
+        "restore",
+        help="put files back from a `dedupe --move-to` quarantine (dry run unless --apply)",
+    )
+    u2.add_argument("location", metavar="DIR_OR_MANIFEST",
+                    help="the quarantine folder, or its dedupe-manifest.jsonl")
+    u2.add_argument("-i", "--include", action="append", default=[], metavar="PAT",
+                    help="only files whose original path matches PAT (glob, or substring); repeatable")
+    u2.add_argument("--apply", action="store_true",
+                    help="actually move the files back; without it this only lists them")
+    u2.add_argument("-t", "--top", type=int, default=20,
+                    help="list N files (0 = all); limits the printout only")
+    u2.add_argument("--json", action="store_true", help="machine-readable output")
+    u2.add_argument("-v", "--verbose", action="store_true", help="list every file")
 
     s = sub.add_parser(
         "similar", help="find 'name (1).ext' style copies next to their original (report only)"
@@ -363,6 +378,7 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
             print(f"\n{done} {len(outcome.removed):,} files, freed {human(outcome.freed)}")
             if manifest and outcome.removed:
                 print(f"manifest: {manifest}")
+                print(f"undo with: dupedisk restore {os.path.abspath(args.move_to)}")
             if args.verbose:
                 for path in outcome.removed:
                     print(f"{done}: {path}")
@@ -370,6 +386,48 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
                 print(f"left alone: {path} ({why})", file=sys.stderr)
     _report_errors(report.errors, args.verbose)
     return 1 if outcome is not None and outcome.failed else 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    manifest = manifest_path_for(args.location)
+    if not os.path.isfile(manifest):
+        print(f"dupedisk: no manifest at {manifest}", file=sys.stderr)
+        return 2
+    try:
+        result = restore(args.location, apply=args.apply, only=args.include)
+    except OSError as exc:
+        print(f"dupedisk: cannot read {manifest}: {exc}", file=sys.stderr)
+        return 2
+
+    root = os.path.dirname(manifest)
+    if args.json:
+        print(json.dumps({
+            "dry_run": not args.apply,
+            "manifest": manifest,
+            "restored": [{"original": e.original, "stored": os.path.join(root, e.stored)}
+                         for e in result.restored],
+            "skipped": [{"original": e.original, "reason": why} for e, why in result.skipped],
+            "unreadable_lines": result.malformed,
+        }, indent=2))
+    else:
+        verb = "restored" if args.apply else "would restore"
+        print(f"manifest: {manifest}")
+        if not result.restored and not result.skipped:
+            print("nothing to restore")
+        else:
+            print(f"{verb} {len(result.restored):,} files, {len(result.skipped):,} left in the quarantine")
+            shown = result.restored if args.verbose or args.top <= 0 else result.restored[: args.top]
+            for e in shown:
+                print(f"    {e.original}")
+            if len(shown) < len(result.restored):
+                print(f"    ... {len(result.restored) - len(shown)} more (--top 0 for all)")
+            if not args.apply and result.restored:
+                print("\ndry run: nothing was moved. Re-run with --apply to put these files back.")
+        for e, why in result.skipped:
+            print(f"left in quarantine: {e.original} ({why})", file=sys.stderr)
+        if result.malformed:
+            print(f"{result.malformed} unreadable manifest line(s) ignored", file=sys.stderr)
+    return 1 if args.apply and result.skipped else 0
 
 
 def _cmd_similar(args: argparse.Namespace) -> int:
@@ -481,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")  # odd filenames must not crash a cp1252 console
     args = build_parser().parse_args(argv)
     handler = {
-        "dupes": _cmd_dupes, "dedupe": _cmd_dedupe, "similar": _cmd_similar,
+        "dupes": _cmd_dupes, "dedupe": _cmd_dedupe, "restore": _cmd_restore, "similar": _cmd_similar,
         "usage": _cmd_usage, "largest": _cmd_largest, "cache": _cmd_cache,
     }[args.command]
     try:
