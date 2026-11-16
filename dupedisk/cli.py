@@ -12,6 +12,7 @@ from . import __version__
 from .cache import HashCache
 from .dedupe import RULES, Plan, apply_plans, plan_against, plan_by_rule
 from .dupes import DupeReport, against_reference, find_duplicates, is_within
+from .quarantine import Quarantine
 from .similar import CopySet, find_similar_names
 from .sizes import human, parse_age, parse_size
 from .usage import largest_files, node_to_dict, render_tree, scan
@@ -105,6 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--hardlink", action="store_true",
                    help="instead of deleting, replace each extra copy with a hard link to the kept "
                         "copy: every path stays, the space is freed (same volume, NTFS/ext4/...)")
+    r.add_argument("--move-to", metavar="DIR",
+                   help="instead of deleting, move each extra copy into DIR, with a manifest of "
+                        "where every file came from; must be outside the scanned folders")
     r.add_argument("--apply", action="store_true",
                    help="actually do it; without it this only prints what would happen")
     r.add_argument("-t", "--top", type=int, default=20,
@@ -280,6 +284,15 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
         print(f"dupedisk: say which copy survives with --keep {{{','.join(RULES)}}} "
               "(or compare against a folder with --against DIR)", file=sys.stderr)
         return 2
+    if args.move_to:
+        if args.hardlink:
+            print("dupedisk: --move-to and --hardlink are alternatives", file=sys.stderr)
+            return 2
+        for root in args.paths + ([args.against] if args.against else []):
+            if is_within(args.move_to, root) or is_within(root, args.move_to):
+                print(f"dupedisk: --move-to {args.move_to} overlaps {root}; pick a folder "
+                      "outside what is being scanned", file=sys.stderr)
+                return 2
     try:
         report = _scan_duplicates(args, show_progress=not args.json)
     except ValueError as exc:
@@ -289,13 +302,31 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
     plans = plan_against(report.groups) if args.against else plan_by_rule(report.groups, args.keep)
     removals = sum(len(p.remove) for p in plans)
     would_free = sum(p.freed for p in plans)
-    outcome = apply_plans(plans, None, link=args.hardlink) if args.apply else None
-    verb = "link" if args.hardlink else "remove"
+    outcome = None
+    manifest = None
+    if args.apply:
+        quarantine = None
+        if args.move_to and plans:
+            try:
+                quarantine = Quarantine(args.move_to)
+            except OSError as exc:
+                print(f"dupedisk: cannot use --move-to {args.move_to}: {exc}", file=sys.stderr)
+                return 2
+            manifest = quarantine.manifest
+        try:
+            outcome = apply_plans(plans, None, link=args.hardlink, quarantine=quarantine)
+        finally:
+            if quarantine is not None:
+                quarantine.close()
+    verb = "link" if args.hardlink else "move" if args.move_to else "remove"
+    mode = "hardlink" if args.hardlink else "move" if args.move_to else "delete"
 
     if args.json:
         payload = {
             "dry_run": not args.apply,
-            "mode": "hardlink" if args.hardlink else "delete",
+            "mode": mode,
+            "move_to": os.path.abspath(args.move_to) if args.move_to else None,
+            "manifest": manifest,
             "keep": args.keep,
             "against": args.against,
             "files_scanned": report.files_scanned,
@@ -318,7 +349,8 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
         else:
             basis = (f"keeping the copies in {os.path.abspath(args.against)}" if args.against
                      else f"keeping the {args.keep} copy of each set")
-            action = "replace with hard links" if args.hardlink else "remove"
+            action = ("replace with hard links" if args.hardlink
+                      else f"move to {os.path.abspath(args.move_to)}" if args.move_to else "remove")
             print(f"plan: {action} {removals:,} files from {len(plans):,} sets, "
                   f"freeing {human(would_free)} ({basis})\n")
             _print_plan(plans, args.top, verb)
@@ -327,8 +359,10 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
                 print(f"\ndry run: nothing was changed. Re-run with --apply to act on the "
                       f"files marked '{verb}'.")
         else:
-            done = "replaced with hard links" if args.hardlink else "removed"
+            done = "replaced with hard links" if args.hardlink else "moved" if args.move_to else "removed"
             print(f"\n{done} {len(outcome.removed):,} files, freed {human(outcome.freed)}")
+            if manifest and outcome.removed:
+                print(f"manifest: {manifest}")
             if args.verbose:
                 for path in outcome.removed:
                     print(f"{done}: {path}")

@@ -13,7 +13,7 @@ Python 3.10+.
 
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against DIR] [--cache FILE] [--json | --csv] [-v]
-python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--hardlink] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
+python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--hardlink | --move-to DIR] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
@@ -116,10 +116,31 @@ not FAT). The catch is that the paths now share one file: editing one edits all 
 they all take the kept copy's timestamps and permissions. After `--hardlink --apply`, `dupes`
 no longer reports the set, since linked files are one file.
 
+`--move-to DIR` moves each extra copy into a quarantine folder instead of deleting it:
+
+```
+$ python -m dupedisk dedupe C:\Users\me\Downloads --keep oldest --move-to D:\dupe-trash --apply
+moved 145 files, freed 757.0 MiB
+manifest: D:\dupe-trash\dedupe-manifest.jsonl
+```
+
+- A file lands at `DIR\<drive>\<its original path>` (`DIR\C\Users\me\Downloads\x.bin`;
+  network paths go under `_unc`), so nothing collides and you can see where it came from. A
+  second file with the same path gets a `.1`, `.2` suffix.
+- `dedupe-manifest.jsonl` gets one line per move, written and flushed *before* the move, so a
+  file is never in the quarantine without a record. A move that fails is marked `aborted`.
+  The file keeps its modification time.
+- On another volume the file is copied, the copy is checked against the original, and only
+  then is the original deleted. If the copy doesn't match, or the original can't be removed,
+  the original stays and the half-made copy is cleaned up.
+- DIR must be outside every scanned folder, and no scanned folder may sit inside it: a
+  quarantine under the scanned tree would show its own contents as duplicates next time.
+  `--move-to` and `--hardlink` are alternatives. A dry run creates nothing.
+
 A file that fails a check is left alone and listed on stderr as `left alone: PATH (why)`, the
 rest of the plan still runs, and the exit status is 1. Nothing is ever force-deleted: a
 read-only file that Windows refuses to remove is reported, not chmod'ed. Deletion is
-permanent (no Recycle Bin yet). `-t` only limits what is printed; `--apply` acts on every
+permanent (unless you use `--move-to`). `-t` only limits what is printed; `--apply` acts on every
 set. `--json` gives the plan and, with `--apply`, what was removed and what failed.
 
 ## Copies by name
@@ -186,7 +207,8 @@ python -m unittest discover -s tests
 ## Roadmap
 
 - [x] `dedupe`: dry run by default, `--apply` to delete, keep rules, re-verified per file
-- [ ] send to Recycle Bin instead of unlinking
+- [x] quarantine folder instead of unlinking (`dedupe --move-to DIR`)
+- [ ] `restore` command to put quarantined files back
 - [x] replace duplicates with hard links (`dedupe --hardlink`)
 - [x] hash cache between runs (`dupes --cache FILE`)
 - [x] `cache --prune` to drop entries for files that are gone or changed

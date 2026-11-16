@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from .dupes import DupeGroup, _digest
+from .quarantine import Quarantine
 
 RULES = ("oldest", "newest", "shortest-path", "first")
 
@@ -117,9 +118,15 @@ def _link_in_place(victim: str, keeper: str) -> None:
         raise
 
 
-def _act_verified(victim: str, keeper: str, digest: str, size: int, link: bool) -> str | None:
-    """Delete (or hard-link) ``victim`` if it is still an identical, separate copy; else
-    return why it was left alone."""
+def _delete(victim: str, keeper: str) -> None:
+    os.remove(victim)
+
+
+def _act_verified(
+    victim: str, keeper: str, digest: str, size: int, act: Callable[[str, str], object]
+) -> str | None:
+    """Run ``act(victim, keeper)`` (delete, hard-link, quarantine) if ``victim`` is still an
+    identical, separate copy; else return why it was left alone."""
     try:
         if os.path.normcase(os.path.abspath(victim)) == os.path.normcase(os.path.abspath(keeper)):
             return "same path as the kept copy"
@@ -129,22 +136,30 @@ def _act_verified(victim: str, keeper: str, digest: str, size: int, link: bool) 
             return "changed since the scan"
         if _digest(victim, None) != digest:
             return "no longer identical to the kept copy"
-        if link:
-            _link_in_place(victim, keeper)
-        else:
-            os.remove(victim)
+        act(victim, keeper)
     except OSError as exc:
         return exc.strerror or str(exc)
     return None
 
 
 def apply_plans(
-    plans: Iterable[Plan], on_remove: Callable[[str], None] | None = None, link: bool = False
+    plans: Iterable[Plan],
+    on_remove: Callable[[str], None] | None = None,
+    link: bool = False,
+    quarantine: Quarantine | None = None,
 ) -> Outcome:
-    """Carry out ``plans``: delete each copy to remove, or with ``link`` replace it by a hard
-    link to the kept copy. A file that fails any check is left alone and reported in
-    ``Outcome.failed``; the rest of the plan still runs. ``Outcome.removed`` lists the paths
-    that were deleted (or replaced)."""
+    """Carry out ``plans``: delete each copy to remove, with ``link`` replace it by a hard
+    link to the kept copy, or with ``quarantine`` move it into that quarantine. A file that
+    fails any check is left alone and reported in ``Outcome.failed``; the rest of the plan
+    still runs. ``Outcome.removed`` lists the paths that were deleted, replaced or moved."""
+    if link and quarantine is not None:
+        raise ValueError("choose hard links or a quarantine, not both")
+    if quarantine is not None:
+        act = lambda victim, keeper: quarantine.move(victim)
+    elif link:
+        act = _link_in_place
+    else:
+        act = _delete
     out = Outcome()
     for plan in plans:
         keeper = _pick_keeper(plan)
@@ -153,7 +168,7 @@ def apply_plans(
             continue
         keeper_path, digest = keeper
         for victim in plan.remove:
-            why = _act_verified(victim, keeper_path, digest, plan.size, link)
+            why = _act_verified(victim, keeper_path, digest, plan.size, act)
             if why is None:
                 out.removed.append(victim)
                 out.freed += plan.size
