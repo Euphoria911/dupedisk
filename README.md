@@ -3,7 +3,8 @@
 Find duplicate files and see where your disk went. One small CLI, no dependencies,
 Python 3.10+.
 
-- **Report only.** v0.1 never deletes anything.
+- **Reports by default.** `dupes`, `similar`, `usage` and `largest` never change a file.
+  `dedupe` is the only command that deletes, and it is a dry run unless you add `--apply`.
 - Never follows symlinks or NTFS junctions, so it can't loop through `Application Data`.
 - Hard links to the same data are not reported as duplicates.
 - Unreadable paths are skipped and counted, not fatal.
@@ -12,6 +13,7 @@ Python 3.10+.
 
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against DIR] [--cache FILE] [--json | --csv] [-v]
+python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
@@ -74,6 +76,43 @@ reference (kept): C:\Users\me\Documents
 - A PATH inside DIR is an error: there would be nothing outside the reference to compare.
 - `--json` adds `against` and a `keep` list per set. `--csv` adds a `role` column (`keep` or
   `dupe`). Without `--against` the output is unchanged.
+
+## Removing duplicates
+
+`dedupe` finds the same sets as `dupes`, picks the copy that survives, and removes the rest.
+It plans first and **does nothing without `--apply`**:
+
+```
+$ python -m dupedisk dedupe C:\Users\me\Downloads -m 100K --keep oldest
+scanned 11,512 files (5.0 GiB)
+plan: remove 145 files from 138 sets, freeing 757.0 MiB (keeping the oldest copy of each set)
+
+[1] 2 x 131.7 MiB  (frees 131.7 MiB)
+    keep    C:\Users\me\Downloads\maps\de_boulder.opt
+    remove  C:\Users\me\Downloads\x64\Debug\maps\de_boulder.opt
+...
+dry run: nothing was deleted. Re-run with --apply to remove the files marked 'remove'.
+```
+
+Say which copy lives, one way or the other (there is no default, on purpose):
+
+- `--keep oldest | newest | shortest-path | first` keeps one copy per set by modification
+  time, path length, or alphabetical order. Ties fall back to the path, so the same tree
+  always gives the same plan.
+- `--against DIR` keeps every copy inside DIR and removes the copies outside it (see above).
+
+What `--apply` checks before each deletion, for every file, at that moment:
+
+- it still exists and still has the size it had in the plan,
+- its contents still hash the same as a kept copy (a file edited since the scan is left alone),
+- it is not a hard link to the kept copy, and not the kept copy itself,
+- at least one kept copy is still readable. If none is, the whole set is skipped.
+
+A file that fails a check is left alone and listed on stderr as `left alone: PATH (why)`, the
+rest of the plan still runs, and the exit status is 1. Nothing is ever force-deleted: a
+read-only file that Windows refuses to remove is reported, not chmod'ed. Deletion is
+permanent (no Recycle Bin yet). `-t` only limits what is printed; `--apply` acts on every
+set. `--json` gives the plan and, with `--apply`, what was removed and what failed.
 
 ## Copies by name
 
@@ -138,7 +177,7 @@ python -m unittest discover -s tests
 
 ## Roadmap
 
-- [ ] `--delete` with a dry-run default, keep-rule (`--keep oldest|newest|shortest-path`)
+- [x] `dedupe`: dry run by default, `--apply` to delete, keep rules, re-verified per file
 - [ ] send to Recycle Bin instead of unlinking
 - [ ] replace duplicates with hard links
 - [x] hash cache between runs (`dupes --cache FILE`)

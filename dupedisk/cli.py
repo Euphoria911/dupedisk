@@ -10,6 +10,7 @@ import time
 
 from . import __version__
 from .cache import HashCache
+from .dedupe import RULES, Plan, apply_plans, plan_against, plan_by_rule
 from .dupes import DupeReport, against_reference, find_duplicates, is_within
 from .similar import CopySet, find_similar_names
 from .sizes import human, parse_age, parse_size
@@ -53,6 +54,20 @@ def _cutoff(args: argparse.Namespace) -> float | None:
     return None if args.since is None else time.time() - parse_age(args.since)
 
 
+def _add_scan_options(p: argparse.ArgumentParser) -> None:
+    """What `dupes` and `dedupe` share: where to look, how to hash, what to compare against."""
+    p.add_argument("paths", nargs="+", metavar="PATH")
+    p.add_argument("-m", "--min-size", type=_size_arg, default=1, metavar="SIZE",
+                   help="ignore files smaller than SIZE, e.g. 1M (default: 1 byte)")
+    p.add_argument("-j", "--jobs", type=_jobs_arg, default=1, metavar="N",
+                   help="hash N files at once (0 = one per CPU; default 1, best on SSDs)")
+    p.add_argument("--against", metavar="DIR",
+                   help="treat DIR as the copies to keep: only files outside it that "
+                        "already exist inside it are considered")
+    p.add_argument("--cache", metavar="FILE",
+                   help="SQLite hash cache; unchanged files (same size and mtime) are not re-read")
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "-x", "--exclude", action="append", default=[], metavar="PAT",
@@ -69,24 +84,31 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     d = sub.add_parser("dupes", help="find duplicate files (report only, never deletes)")
-    d.add_argument("paths", nargs="+", metavar="PATH")
-    d.add_argument("-m", "--min-size", type=_size_arg, default=1, metavar="SIZE",
-                   help="ignore files smaller than SIZE, e.g. 1M (default: 1 byte)")
+    _add_scan_options(d)
     d.add_argument("-t", "--top", type=int, default=20,
                    help="show the N sets with the most reclaimable space (0 = all)")
-    d.add_argument("-j", "--jobs", type=_jobs_arg, default=1, metavar="N",
-                   help="hash N files at once (0 = one per CPU; default 1, best on SSDs)")
-    d.add_argument("--against", metavar="DIR",
-                   help="treat DIR as the copies to keep: report only files outside it that "
-                        "already exist inside it")
-    d.add_argument("--cache", metavar="FILE",
-                   help="SQLite hash cache; unchanged files (same size and mtime) are not re-read")
     fmt = d.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="machine-readable output")
     fmt.add_argument("--csv", action="store_true",
                      help="one row per file: set,size_bytes,path (all sets, ignores --top); "
                           "with --against a role column says keep or dupe")
     _add_common(d)
+
+    r = sub.add_parser(
+        "dedupe",
+        help="delete duplicate copies (dry run unless --apply; every file is re-verified first)",
+    )
+    _add_scan_options(r)
+    r.add_argument("--keep", choices=RULES, metavar="RULE",
+                   help="which copy of each set survives: " + ", ".join(RULES)
+                        + " (not used with --against, where the reference copies survive)")
+    r.add_argument("--apply", action="store_true",
+                   help="actually delete; without it this only prints what would be removed")
+    r.add_argument("-t", "--top", type=int, default=20,
+                   help="print the N sets that free the most space (0 = all); "
+                        "limits the printout only, --apply acts on every set")
+    r.add_argument("--json", action="store_true", help="machine-readable plan and result")
+    _add_common(r)
 
     s = sub.add_parser(
         "similar", help="find 'name (1).ext' style copies next to their original (report only)"
@@ -159,27 +181,29 @@ def _print_dupes(report: DupeReport, top: int, against: str | None = None) -> No
         print(f"\n... {len(report.groups) - len(shown)} more sets (--top 0 for all)")
 
 
-def _cmd_dupes(args: argparse.Namespace) -> int:
+def _scan_duplicates(args: argparse.Namespace, show_progress: bool) -> DupeReport:
+    """Validate the paths, open the cache, scan. Bad input raises ``ValueError`` (the CLI
+    reports it and exits 2). With ``--against`` the groups are already reduced to the sets
+    that straddle the reference folder."""
     for path in args.paths + ([args.against] if args.against else []):
         if not os.path.isdir(path):
-            print(f"dupedisk: not a directory: {path}", file=sys.stderr)
-            return 2
+            raise ValueError(f"not a directory: {path}")
     if args.against:
         for path in args.paths:
             if is_within(path, args.against):
-                print(f"dupedisk: {path} is inside --against {args.against}; "
-                      "nothing outside the reference to compare", file=sys.stderr)
-                return 2
+                raise ValueError(
+                    f"{path} is inside --against {args.against}; "
+                    "nothing outside the reference to compare"
+                )
     progress = None
-    if sys.stderr.isatty() and not (args.json or args.csv):
+    if show_progress and sys.stderr.isatty():
         progress = lambda n: print(f"\rscanning... {n:,} files", end="", file=sys.stderr, flush=True)
     cache = None
     if args.cache:
         try:
             cache = HashCache(args.cache)
         except sqlite3.Error as exc:
-            print(f"dupedisk: cannot open cache {args.cache}: {exc}", file=sys.stderr)
-            return 2
+            raise ValueError(f"cannot open cache {args.cache}: {exc}") from None
     try:
         roots = args.paths + ([args.against] if args.against else [])
         report = find_duplicates(roots, args.min_size, args.exclude, progress, cache, args.jobs)
@@ -190,6 +214,15 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
     if args.against:
         report.groups = against_reference(report.groups, args.against)
+    return report
+
+
+def _cmd_dupes(args: argparse.Namespace) -> int:
+    try:
+        report = _scan_duplicates(args, show_progress=not (args.json or args.csv))
+    except ValueError as exc:
+        print(f"dupedisk: {exc}", file=sys.stderr)
+        return 2
 
     if args.csv:
         writer = csv.writer(sys.stdout, lineterminator="\n")
@@ -220,6 +253,82 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
         _print_dupes(report, args.top, args.against)
     _report_errors(report.errors, args.verbose)
     return 0
+
+
+def _print_plan(plans: list[Plan], top: int) -> None:
+    shown = plans[:top] if top > 0 else plans
+    for i, plan in enumerate(shown, 1):
+        copies = len(plan.keep) + len(plan.remove)
+        print(f"[{i}] {copies} x {human(plan.size)}  (frees {human(plan.freed)})")
+        for path in plan.keep:
+            print(f"    keep    {path}")
+        for path in plan.remove:
+            print(f"    remove  {path}")
+    if len(shown) < len(plans):
+        print(f"\n... {len(plans) - len(shown)} more sets (--top 0 for all)")
+
+
+def _cmd_dedupe(args: argparse.Namespace) -> int:
+    if args.against and args.keep:
+        print("dupedisk: --keep and --against are alternatives: with --against the copies "
+              "inside the reference folder are the ones kept", file=sys.stderr)
+        return 2
+    if not args.against and not args.keep:
+        print(f"dupedisk: say which copy survives with --keep {{{','.join(RULES)}}} "
+              "(or compare against a folder with --against DIR)", file=sys.stderr)
+        return 2
+    try:
+        report = _scan_duplicates(args, show_progress=not args.json)
+    except ValueError as exc:
+        print(f"dupedisk: {exc}", file=sys.stderr)
+        return 2
+
+    plans = plan_against(report.groups) if args.against else plan_by_rule(report.groups, args.keep)
+    removals = sum(len(p.remove) for p in plans)
+    would_free = sum(p.freed for p in plans)
+    outcome = apply_plans(plans, None) if args.apply else None
+
+    if args.json:
+        payload = {
+            "dry_run": not args.apply,
+            "keep": args.keep,
+            "against": args.against,
+            "files_scanned": report.files_scanned,
+            "plan": [
+                {"size": p.size, "keep": list(p.keep), "remove": list(p.remove)} for p in plans
+            ],
+            "would_free": would_free,
+            "skipped": len(report.errors),
+        }
+        if outcome is not None:
+            payload["removed"] = outcome.removed
+            payload["freed"] = outcome.freed
+            payload["failed"] = [{"path": p, "reason": why} for p, why in outcome.failed]
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"scanned {report.files_scanned:,} files ({human(report.bytes_scanned)})")
+        if not plans:
+            print("nothing outside the reference is duplicated in it" if args.against
+                  else "no duplicates found, nothing to remove")
+        else:
+            basis = (f"keeping the copies in {os.path.abspath(args.against)}" if args.against
+                     else f"keeping the {args.keep} copy of each set")
+            print(f"plan: remove {removals:,} files from {len(plans):,} sets, "
+                  f"freeing {human(would_free)} ({basis})\n")
+            _print_plan(plans, args.top)
+        if outcome is None:
+            if plans:
+                print("\ndry run: nothing was deleted. Re-run with --apply to remove the "
+                      "files marked 'remove'.")
+        else:
+            print(f"\nremoved {len(outcome.removed):,} files, freed {human(outcome.freed)}")
+            if args.verbose:
+                for path in outcome.removed:
+                    print(f"removed: {path}")
+            for path, why in outcome.failed:
+                print(f"left alone: {path} ({why})", file=sys.stderr)
+    _report_errors(report.errors, args.verbose)
+    return 1 if outcome is not None and outcome.failed else 0
 
 
 def _cmd_similar(args: argparse.Namespace) -> int:
@@ -331,8 +440,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")  # odd filenames must not crash a cp1252 console
     args = build_parser().parse_args(argv)
     handler = {
-        "dupes": _cmd_dupes, "similar": _cmd_similar, "usage": _cmd_usage,
-        "largest": _cmd_largest, "cache": _cmd_cache,
+        "dupes": _cmd_dupes, "dedupe": _cmd_dedupe, "similar": _cmd_similar,
+        "usage": _cmd_usage, "largest": _cmd_largest, "cache": _cmd_cache,
     }[args.command]
     try:
         return handler(args)
