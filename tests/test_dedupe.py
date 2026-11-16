@@ -210,6 +210,108 @@ class ApplyTests(TempTree):
             self.assertTrue(any(f.exists() for f in files))
 
 
+def hardlinks_work(directory: Path) -> bool:
+    a = directory / "probe-a"
+    a.write_bytes(b"x")
+    try:
+        os.link(a, directory / "probe-b")
+    except (OSError, NotImplementedError):
+        return False
+    finally:
+        for name in ("probe-a", "probe-b"):
+            try:
+                (directory / name).unlink()
+            except OSError:
+                pass
+    return True
+
+
+class HardlinkTests(TempTree):
+    def setUp(self):
+        super().setUp()
+        if not hardlinks_work(self.root):
+            self.skipTest("hard links unavailable here")
+
+    def leftovers(self):
+        return [p.name for p in self.root.rglob("*") if ".dupedisk-" in p.name]
+
+    def plan_for(self, keep: Path, *victims: Path) -> Plan:
+        return Plan(keep.stat().st_size, (str(keep),), tuple(str(v) for v in victims))
+
+    def test_victims_become_links_and_every_path_survives(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        a = write(self.root, "sub/a.txt", b"identical")
+        b = write(self.root, "b.txt", b"identical")
+        out = apply_plans([self.plan_for(keep, a, b)], link=True)
+        self.assertEqual((sorted(out.removed), out.failed), (sorted([str(a), str(b)]), []))
+        self.assertEqual(out.freed, 2 * len(b"identical"))
+        for path in (keep, a, b):
+            self.assertEqual(path.read_bytes(), b"identical")
+        self.assertTrue(os.path.samefile(a, keep) and os.path.samefile(b, keep))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_linked_set_is_no_longer_reported_as_duplicates(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        a = write(self.root, "a.txt", b"identical")
+        (plan,) = plan_by_rule(find_duplicates([str(self.root)]).groups, "first")
+        apply_plans([plan], link=True)
+        self.assertEqual(find_duplicates([str(self.root)]).groups, [])
+        self.assertTrue(keep.exists() and a.exists())
+
+    def test_edited_copy_is_not_replaced(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        victim = write(self.root, "victim.txt", b"identical")
+        plan = self.plan_for(keep, victim)
+        victim.write_bytes(b"IDENTICAL")
+        out = apply_plans([plan], link=True)
+        self.assertEqual(out.removed, [])
+        self.assertFalse(os.path.samefile(victim, keep))
+        self.assertEqual(victim.read_bytes(), b"IDENTICAL")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_already_linked_pair_is_left_alone(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        twin = self.root / "twin.txt"
+        os.link(keep, twin)
+        out = apply_plans([self.plan_for(keep, twin)], link=True)
+        self.assertEqual(out.removed, [])
+        self.assertIn("already a hard link", out.failed[0][1])
+
+    def test_link_failure_leaves_the_victim_and_no_temp_file(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        victim = write(self.root, "victim.txt", b"identical")
+        with mock.patch.object(os, "link", side_effect=OSError(18, "Invalid cross-device link")):
+            out = apply_plans([self.plan_for(keep, victim)], link=True)
+        self.assertEqual(out.removed, [])
+        self.assertIn("cross-device", out.failed[0][1])
+        self.assertEqual(victim.read_bytes(), b"identical")
+        self.assertFalse(os.path.samefile(victim, keep))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_rename_failure_cleans_up_the_temporary_link(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        victim = write(self.root, "victim.txt", b"identical")
+        with mock.patch.object(os, "replace", side_effect=PermissionError(13, "Permission denied")):
+            out = apply_plans([self.plan_for(keep, victim)], link=True)
+        self.assertEqual(out.removed, [])
+        self.assertIn("Permission denied", out.failed[0][1])
+        self.assertFalse(os.path.samefile(victim, keep))  # still its own file
+        self.assertEqual(self.leftovers(), [])  # and the temp link is gone
+
+    @unittest.skipUnless(os.name == "nt", "Windows refuses to replace a read-only file")
+    def test_read_only_victim_is_reported_and_kept(self):
+        keep = write(self.root, "keep.txt", b"identical")
+        victim = write(self.root, "victim.txt", b"identical")
+        os.chmod(victim, stat.S_IREAD)
+        try:
+            out = apply_plans([self.plan_for(keep, victim)], link=True)
+            self.assertEqual(out.removed, [])
+            self.assertEqual([p for p, _ in out.failed], [str(victim)])
+            self.assertEqual(self.leftovers(), [])
+        finally:
+            os.chmod(victim, stat.S_IWRITE)
+
+
 class DedupeCliTests(TempTree):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -242,7 +344,7 @@ class DedupeCliTests(TempTree):
         before = self.listing()
         code, out, _ = self.run_cli("dedupe", str(self.root), "--keep", "first")
         self.assertEqual(code, 0)
-        self.assertIn("dry run: nothing was deleted", out)
+        self.assertIn("dry run: nothing was changed", out)
         self.assertIn("plan: remove 3 files from 3 sets", out)
         self.assertIn("keep    ", out)
         self.assertIn("remove  ", out)
@@ -313,6 +415,42 @@ class DedupeCliTests(TempTree):
         self.assertIn("left alone:", err)
         self.assertIn("Permission denied", err)
         self.assertTrue((self.root / "set1" / "b.txt").exists())
+
+    def test_hardlink_mode_dry_run_then_apply(self):
+        self.make_sets(2)
+        before = self.listing()
+        code, out, _ = self.run_cli("dedupe", str(self.root), "--keep", "first", "--hardlink")
+        self.assertEqual(code, 0)
+        self.assertIn("plan: replace with hard links 2 files", out)
+        self.assertRegex(out, r"link\s+.*b\.txt")
+        self.assertNotIn("remove  ", out)
+        self.assertIn("files marked 'link'", out)
+        self.assertEqual(self.listing(), before)
+        if not hardlinks_work(self.root):
+            self.skipTest("hard links unavailable here")
+        self.assertFalse(os.path.samefile(self.root / "set0" / "a.txt", self.root / "set0" / "b.txt"))
+
+        code, out, err = self.run_cli("dedupe", str(self.root), "--keep", "first", "--hardlink", "--apply")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("replaced with hard links 2 files", out)
+        self.assertEqual(self.listing(), before)  # every path is still there
+        for i in range(2):
+            self.assertTrue(os.path.samefile(self.root / f"set{i}" / "a.txt", self.root / f"set{i}" / "b.txt"))
+        self.assertIn("no duplicates found", self.run_cli("dupes", str(self.root))[1])
+
+    def test_hardlink_json_and_against(self):
+        if not hardlinks_work(self.root):
+            self.skipTest("hard links unavailable here")
+        write(self.root, "archive/a.txt", b"alpha-content")
+        write(self.root, "inbox/a_copy.txt", b"alpha-content")
+        inbox, archive = str(self.root / "inbox"), str(self.root / "archive")
+        data = json.loads(self.run_cli("dedupe", inbox, "--against", archive, "--hardlink",
+                                       "--apply", "--json")[1])
+        self.assertEqual((data["mode"], data["dry_run"], len(data["removed"]), data["failed"]),
+                         ("hardlink", False, 1, []))
+        self.assertTrue(os.path.samefile(self.root / "inbox" / "a_copy.txt", self.root / "archive" / "a.txt"))
+        plain = json.loads(self.run_cli("dedupe", inbox, "--against", archive, "--json")[1])
+        self.assertEqual(plain["mode"], "delete")
 
     def test_bad_directory_and_empty_result(self):
         self.assertEqual(self.run_cli("dedupe", str(self.root / "nope"), "--keep", "first")[0], 2)

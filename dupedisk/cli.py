@@ -102,8 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--keep", choices=RULES, metavar="RULE",
                    help="which copy of each set survives: " + ", ".join(RULES)
                         + " (not used with --against, where the reference copies survive)")
+    r.add_argument("--hardlink", action="store_true",
+                   help="instead of deleting, replace each extra copy with a hard link to the kept "
+                        "copy: every path stays, the space is freed (same volume, NTFS/ext4/...)")
     r.add_argument("--apply", action="store_true",
-                   help="actually delete; without it this only prints what would be removed")
+                   help="actually do it; without it this only prints what would happen")
     r.add_argument("-t", "--top", type=int, default=20,
                    help="print the N sets that free the most space (0 = all); "
                         "limits the printout only, --apply acts on every set")
@@ -255,15 +258,15 @@ def _cmd_dupes(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_plan(plans: list[Plan], top: int) -> None:
+def _print_plan(plans: list[Plan], top: int, verb: str = "remove") -> None:
     shown = plans[:top] if top > 0 else plans
     for i, plan in enumerate(shown, 1):
         copies = len(plan.keep) + len(plan.remove)
         print(f"[{i}] {copies} x {human(plan.size)}  (frees {human(plan.freed)})")
         for path in plan.keep:
-            print(f"    keep    {path}")
+            print(f"    {'keep':<7} {path}")
         for path in plan.remove:
-            print(f"    remove  {path}")
+            print(f"    {verb:<7} {path}")
     if len(shown) < len(plans):
         print(f"\n... {len(plans) - len(shown)} more sets (--top 0 for all)")
 
@@ -286,11 +289,13 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
     plans = plan_against(report.groups) if args.against else plan_by_rule(report.groups, args.keep)
     removals = sum(len(p.remove) for p in plans)
     would_free = sum(p.freed for p in plans)
-    outcome = apply_plans(plans, None) if args.apply else None
+    outcome = apply_plans(plans, None, link=args.hardlink) if args.apply else None
+    verb = "link" if args.hardlink else "remove"
 
     if args.json:
         payload = {
             "dry_run": not args.apply,
+            "mode": "hardlink" if args.hardlink else "delete",
             "keep": args.keep,
             "against": args.against,
             "files_scanned": report.files_scanned,
@@ -313,18 +318,20 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
         else:
             basis = (f"keeping the copies in {os.path.abspath(args.against)}" if args.against
                      else f"keeping the {args.keep} copy of each set")
-            print(f"plan: remove {removals:,} files from {len(plans):,} sets, "
+            action = "replace with hard links" if args.hardlink else "remove"
+            print(f"plan: {action} {removals:,} files from {len(plans):,} sets, "
                   f"freeing {human(would_free)} ({basis})\n")
-            _print_plan(plans, args.top)
+            _print_plan(plans, args.top, verb)
         if outcome is None:
             if plans:
-                print("\ndry run: nothing was deleted. Re-run with --apply to remove the "
-                      "files marked 'remove'.")
+                print(f"\ndry run: nothing was changed. Re-run with --apply to act on the "
+                      f"files marked '{verb}'.")
         else:
-            print(f"\nremoved {len(outcome.removed):,} files, freed {human(outcome.freed)}")
+            done = "replaced with hard links" if args.hardlink else "removed"
+            print(f"\n{done} {len(outcome.removed):,} files, freed {human(outcome.freed)}")
             if args.verbose:
                 for path in outcome.removed:
-                    print(f"removed: {path}")
+                    print(f"{done}: {path}")
             for path, why in outcome.failed:
                 print(f"left alone: {path} ({why})", file=sys.stderr)
     _report_errors(report.errors, args.verbose)

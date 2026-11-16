@@ -13,7 +13,7 @@ Python 3.10+.
 
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against DIR] [--cache FILE] [--json | --csv] [-v]
-python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
+python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--hardlink] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
 python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
@@ -91,7 +91,7 @@ plan: remove 145 files from 138 sets, freeing 757.0 MiB (keeping the oldest copy
     keep    C:\Users\me\Downloads\maps\de_boulder.opt
     remove  C:\Users\me\Downloads\x64\Debug\maps\de_boulder.opt
 ...
-dry run: nothing was deleted. Re-run with --apply to remove the files marked 'remove'.
+dry run: nothing was changed. Re-run with --apply to act on the files marked 'remove'.
 ```
 
 Say which copy lives, one way or the other (there is no default, on purpose):
@@ -107,6 +107,14 @@ What `--apply` checks before each deletion, for every file, at that moment:
 - its contents still hash the same as a kept copy (a file edited since the scan is left alone),
 - it is not a hard link to the kept copy, and not the kept copy itself,
 - at least one kept copy is still readable. If none is, the whole set is skipped.
+
+`--hardlink` keeps every path and still frees the space: each extra copy is replaced by a hard
+link to the kept one. The link is made under a temporary name beside the file and renamed
+over it, so the path is never missing, and a failure leaves the original and removes the
+temporary link. It needs the same volume and a filesystem with hard links (NTFS, ext4, APFS;
+not FAT). The catch is that the paths now share one file: editing one edits all of them, and
+they all take the kept copy's timestamps and permissions. After `--hardlink --apply`, `dupes`
+no longer reports the set, since linked files are one file.
 
 A file that fails a check is left alone and listed on stderr as `left alone: PATH (why)`, the
 rest of the plan still runs, and the exit status is 1. Nothing is ever force-deleted: a
@@ -179,7 +187,7 @@ python -m unittest discover -s tests
 
 - [x] `dedupe`: dry run by default, `--apply` to delete, keep rules, re-verified per file
 - [ ] send to Recycle Bin instead of unlinking
-- [ ] replace duplicates with hard links
+- [x] replace duplicates with hard links (`dedupe --hardlink`)
 - [x] hash cache between runs (`dupes --cache FILE`)
 - [x] `cache --prune` to drop entries for files that are gone or changed
 - [x] parallel hashing (`dupes -j N`)

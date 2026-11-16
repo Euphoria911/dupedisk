@@ -2,7 +2,7 @@
 
 A plan names, per set of identical files, the copies to keep and the copies to remove. Nothing
 is touched until ``apply_plans``, and even then each file is re-checked right before it is
-deleted: it must still exist, still have the planned size, still hash the same as a kept copy,
+deleted (or, with ``link``, replaced by a hard link): it must still exist, still have the planned size, still hash the same as a kept copy,
 and not be a hard link to it. A set always keeps at least one readable copy. Symlinks and
 junctions never get this far, since the scan skips them.
 """
@@ -99,26 +99,52 @@ def _pick_keeper(plan: Plan) -> tuple[str, str] | None:
     return None
 
 
-def _remove_verified(victim: str, keeper: str, digest: str, size: int) -> str | None:
-    """Delete ``victim`` if it is still an identical, separate copy; else return why not."""
+def _link_in_place(victim: str, keeper: str) -> None:
+    """Make ``victim`` a hard link to ``keeper`` without a moment where the path is missing.
+
+    The link is created under a temporary name beside the victim and then renamed over it.
+    If either step fails the temporary link is removed and the victim is untouched.
+    """
+    tmp = f"{victim}.dupedisk-{os.getpid()}.tmp"
+    os.link(keeper, tmp)  # fails across volumes, on FAT, or past the filesystem's link limit
+    try:
+        os.replace(tmp, victim)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _act_verified(victim: str, keeper: str, digest: str, size: int, link: bool) -> str | None:
+    """Delete (or hard-link) ``victim`` if it is still an identical, separate copy; else
+    return why it was left alone."""
     try:
         if os.path.normcase(os.path.abspath(victim)) == os.path.normcase(os.path.abspath(keeper)):
             return "same path as the kept copy"
         if _same_file(victim, keeper):
-            return "hard link to the kept copy (deleting it would free nothing)"
+            return "already a hard link to the kept copy (nothing to free)"
         if os.path.getsize(victim) != size:
             return "changed since the scan"
         if _digest(victim, None) != digest:
             return "no longer identical to the kept copy"
-        os.remove(victim)
+        if link:
+            _link_in_place(victim, keeper)
+        else:
+            os.remove(victim)
     except OSError as exc:
         return exc.strerror or str(exc)
     return None
 
 
-def apply_plans(plans: Iterable[Plan], on_remove: Callable[[str], None] | None = None) -> Outcome:
-    """Carry out ``plans``. A file that fails any check is left alone and reported in
-    ``Outcome.failed``; the rest of the plan still runs."""
+def apply_plans(
+    plans: Iterable[Plan], on_remove: Callable[[str], None] | None = None, link: bool = False
+) -> Outcome:
+    """Carry out ``plans``: delete each copy to remove, or with ``link`` replace it by a hard
+    link to the kept copy. A file that fails any check is left alone and reported in
+    ``Outcome.failed``; the rest of the plan still runs. ``Outcome.removed`` lists the paths
+    that were deleted (or replaced)."""
     out = Outcome()
     for plan in plans:
         keeper = _pick_keeper(plan)
@@ -127,7 +153,7 @@ def apply_plans(plans: Iterable[Plan], on_remove: Callable[[str], None] | None =
             continue
         keeper_path, digest = keeper
         for victim in plan.remove:
-            why = _remove_verified(victim, keeper_path, digest, plan.size)
+            why = _act_verified(victim, keeper_path, digest, plan.size, link)
             if why is None:
                 out.removed.append(victim)
                 out.freed += plan.size
