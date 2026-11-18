@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 
 from .dupes import DupeGroup, _digest
 from .quarantine import Quarantine
@@ -44,7 +45,21 @@ def _mtime_ns(path: str) -> int | None:
         return None
 
 
-def _sort_key(rule: str, path: str) -> tuple:
+def matches_any(path: str, patterns: Iterable[str]) -> bool:
+    """Case-insensitive match of ``path``: a glob against the whole path if the pattern has a
+    wildcard, otherwise a plain substring (``Documents`` matches ``C:\\Users\\me\\Documents\\a``)."""
+    low = path.lower().replace("\\", "/")
+    for pattern in patterns:
+        p = pattern.lower().replace("\\", "/")
+        if any(c in p for c in "*?["):
+            if fnmatchcase(low, p):
+                return True
+        elif p in low:
+            return True
+    return False
+
+
+def _sort_key(rule: str, path: str, prefer: tuple[str, ...] = (), avoid: tuple[str, ...] = ()) -> tuple:
     mtime = _mtime_ns(path)
     unreadable = mtime is None  # a file that can't even be stat'ed is never the one we keep
     if rule == "oldest":
@@ -55,24 +70,42 @@ def _sort_key(rule: str, path: str) -> tuple:
         rank = len(path)
     else:  # "first": plain alphabetical order
         rank = 0
-    return (unreadable, rank, os.path.normcase(path), path)
+    # safety first, then what was asked for (avoided paths lose, preferred paths win), then the rule
+    return (
+        unreadable,
+        matches_any(path, avoid),
+        not matches_any(path, prefer),
+        rank,
+        os.path.normcase(path),
+        path,
+    )
 
 
 def _ordered(plans: list[Plan]) -> list[Plan]:
     return sorted(plans, key=lambda p: (-p.freed, p.keep))
 
 
-def plan_by_rule(groups: Iterable[DupeGroup], rule: str) -> list[Plan]:
+def plan_by_rule(
+    groups: Iterable[DupeGroup],
+    rule: str,
+    prefer: Iterable[str] = (),
+    avoid: Iterable[str] = (),
+) -> list[Plan]:
     """Keep one copy per set, chosen by ``rule``; every other copy is to be removed.
 
     ``oldest`` / ``newest`` go by modification time, ``shortest-path`` by path length,
     ``first`` alphabetically. Ties fall back to the path, so a plan is reproducible.
+
+    ``prefer`` and ``avoid`` are path patterns (see ``matches_any``) that come before the
+    rule: a copy matching ``prefer`` is kept over one that doesn't, a copy matching ``avoid``
+    is kept only if every copy matches. When several copies tie on that, ``rule`` decides.
     """
     if rule not in RULES:
         raise ValueError(f"unknown keep rule {rule!r} (use one of: {', '.join(RULES)})")
+    prefer, avoid = tuple(prefer), tuple(avoid)
     plans = []
     for group in groups:
-        ordered = sorted(group.paths, key=lambda p: _sort_key(rule, p))
+        ordered = sorted(group.paths, key=lambda p: _sort_key(rule, p, prefer, avoid))
         plans.append(Plan(group.size, (ordered[0],), tuple(ordered[1:])))
     return _ordered(plans)
 

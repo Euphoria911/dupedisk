@@ -13,7 +13,7 @@ Python 3.10+.
 
 ```
 python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against DIR] [--cache FILE] [--json | --csv] [-v]
-python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--hardlink | --move-to DIR] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
+python -m dupedisk dedupe  PATH... (--keep RULE [--prefer PAT] [--avoid PAT] | --against DIR) [--hardlink | --move-to DIR] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
 python -m dupedisk restore DIR_OR_MANIFEST [-i PAT] [--apply] [-t N] [--json] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
 python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--older-than AGE] [--json] [-x PAT] [-v]
@@ -106,6 +106,27 @@ Say which copy lives, one way or the other (there is no default, on purpose):
   time, path length, or alphabetical order. Ties fall back to the path, so the same tree
   always gives the same plan.
 - `--against DIR` keeps every copy inside DIR and removes the copies outside it (see above).
+
+`--keep` can be steered by where a copy lives. This is the usual real-world rule, "keep the
+one in Documents, drop the one in Downloads":
+
+```
+python -m dupedisk dedupe C:\Users\me\Downloads C:\Users\me\Documents --keep oldest ^
+    --prefer "*/Documents/*" --avoid "*/Downloads/*"
+```
+
+- `--prefer PAT`: a copy matching PAT is kept over one that doesn't.
+- `--avoid PAT`: copies matching PAT are the first to go. If every copy in a set matches,
+  `--keep` decides, so a set is never left without a survivor.
+- Both are repeatable and come **before** `--keep`, which only breaks the remaining ties.
+  A copy matching both is treated as avoided. A copy that can't be read is never the survivor,
+  preferred or not. They don't combine with `--against`, where the reference copies already
+  decide.
+- A pattern with `*`, `?` or `[` is a glob on the whole path (use `/` or `\`, any case). A
+  plain word is a case-insensitive substring of the **whole** path, so a short one like `b`
+  also matches folder and file names you didn't mean: prefer `*/Documents/*` to `Documents`
+  when it matters. The dry run prints the pattern in the plan line, and the plan itself shows
+  which copy was kept.
 
 What `--apply` checks before each deletion, for every file, at that moment:
 

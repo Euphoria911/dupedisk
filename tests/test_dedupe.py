@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from dupedisk.cli import main
-from dupedisk.dedupe import Plan, apply_plans, plan_against, plan_by_rule
+from dupedisk.dedupe import Plan, apply_plans, matches_any, plan_against, plan_by_rule
 from dupedisk.dupes import DupeGroup, against_reference, find_duplicates
 
 
@@ -79,6 +79,43 @@ class PlanTests(TempTree):
     def test_unknown_rule(self):
         with self.assertRaises(ValueError):
             plan_by_rule([], "biggest")
+
+    def test_matches_any(self):
+        path = r"C:\Users\Me\Documents\Photos\a.jpg"
+        self.assertTrue(matches_any(path, ["documents"]))  # substring, any case
+        self.assertTrue(matches_any(path, ["nothing", "PHOTOS"]))
+        self.assertTrue(matches_any(path, ["*/photos/*.jpg"]))  # glob on the whole path
+        self.assertTrue(matches_any(path, [r"*\Documents\*"]))  # backslashes work in patterns too
+        self.assertFalse(matches_any(path, ["*.png"]))
+        self.assertFalse(matches_any(path, ["downloads"]))
+        self.assertFalse(matches_any(path, []))
+
+    def kept_with(self, rule, prefer=(), avoid=()):
+        (plan,) = plan_by_rule(self.four_copies(), rule, prefer, avoid)
+        return Path(plan.keep[0]).parent.name
+
+    def test_prefer_beats_the_rule(self):
+        self.assertEqual(self.kept_with("oldest"), "b")
+        self.assertEqual(self.kept_with("oldest", prefer=["*/d/*"]), "d")
+        self.assertEqual(self.kept_with("newest", prefer=["*/a/*", "*/d/*"]), "d")  # any pattern, then the rule
+
+    def test_avoid_removes_those_copies_first(self):
+        self.assertEqual(self.kept_with("oldest", avoid=["*/b/*"]), "a")  # b is oldest but avoided
+        self.assertEqual(self.kept_with("oldest", avoid=["*/b/*", "*/a/*"]), "d")
+
+    def test_when_every_copy_is_avoided_or_preferred_the_rule_decides(self):
+        self.assertEqual(self.kept_with("oldest", avoid=["*"]), "b")
+        self.assertEqual(self.kept_with("newest", prefer=["*"]), "c")
+
+    def test_prefer_and_avoid_together(self):
+        # c is both preferred and avoided: avoid wins, so c goes and the oldest of a, b, d stays
+        self.assertEqual(self.kept_with("oldest", prefer=["*/c/*"], avoid=["*/c/*"]), "b")
+
+    def test_an_unreadable_copy_is_not_kept_even_if_preferred(self):
+        real = write(self.root, "real.bin", b"x" * 5)
+        ghost = str(self.root / "ghost.bin")
+        (plan,) = plan_by_rule([DupeGroup(5, (ghost, str(real)))], "first", prefer=["ghost"])
+        self.assertEqual(plan.keep, (str(real),))
 
     def test_against_plan_keeps_the_reference_copies(self):
         write(self.root, "archive/a.txt", b"alpha-content")
@@ -338,6 +375,41 @@ class DedupeCliTests(TempTree):
         code, _, err = self.run_cli("dedupe", str(self.root / "x"), "--against", str(archive), "--keep", "first")
         self.assertEqual(code, 2)
         self.assertEqual(self.listing(), before)
+
+    def test_prefer_and_avoid_choose_the_surviving_copy(self):
+        docs = write(self.root, "Documents/report.bin", b"identical", mtime=3_000_000_000)
+        dl = write(self.root, "Downloads/report.bin", b"identical", mtime=1_000_000_000)
+        # "oldest" alone would keep the Downloads copy
+        code, out, _ = self.run_cli("dedupe", str(self.root), "--keep", "oldest")
+        self.assertRegex(out, r"keep\s+.*Downloads")
+        for flags in (("--prefer", "Documents"), ("--avoid", "downloads"), ("--prefer", "*/documents/*")):
+            code, out, _ = self.run_cli("dedupe", str(self.root), "--keep", "oldest", *flags)
+            self.assertEqual(code, 0)
+            self.assertRegex(out, r"keep\s+.*Documents", flags)
+            self.assertRegex(out, r"remove\s+.*Downloads", flags)
+        self.assertIn("preferring Documents", self.run_cli(
+            "dedupe", str(self.root), "--keep", "oldest", "--prefer", "Documents")[1])
+        self.assertIn("avoiding downloads", self.run_cli(
+            "dedupe", str(self.root), "--keep", "oldest", "--avoid", "downloads")[1])
+        code, out, _ = self.run_cli("dedupe", str(self.root), "--keep", "oldest",
+                                    "--prefer", "Documents", "--apply")
+        self.assertEqual(code, 0)
+        self.assertTrue(docs.exists() and not dl.exists())
+
+    def test_prefer_json_and_misuse(self):
+        write(self.root, "Spares/x.bin", b"identical")
+        write(self.root, "Keepers/x.bin", b"identical")
+        data = json.loads(self.run_cli("dedupe", str(self.root), "--keep", "first",
+                                       "--prefer", "Keepers", "--avoid", "Spares", "--json")[1])
+        self.assertEqual((data["prefer"], data["avoid"]), (["Keepers"], ["Spares"]))
+        self.assertTrue(data["plan"][0]["keep"][0].endswith(os.path.join("Keepers", "x.bin")))
+        code, _, err = self.run_cli("dedupe", str(self.root), "--prefer", "Keepers")  # still needs --keep
+        self.assertEqual(code, 2)
+        self.assertIn("--keep", err)
+        code, _, err = self.run_cli("dedupe", str(self.root / "Spares"), "--against", str(self.root / "Keepers"),
+                                    "--prefer", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--against", err)
 
     def test_dry_run_is_the_default_and_touches_nothing(self):
         self.make_sets()

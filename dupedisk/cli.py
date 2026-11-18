@@ -119,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--keep", choices=RULES, metavar="RULE",
                    help="which copy of each set survives: " + ", ".join(RULES)
                         + " (not used with --against, where the reference copies survive)")
+    r.add_argument("--prefer", action="append", default=[], metavar="PAT",
+                   help="keep a copy whose path matches PAT over one that doesn't (glob on the "
+                        "whole path, or a substring); repeatable; needs --keep as the tie-break")
+    r.add_argument("--avoid", action="append", default=[], metavar="PAT",
+                   help="remove copies whose path matches PAT first; if every copy matches, "
+                        "--keep decides; repeatable")
     r.add_argument("--hardlink", action="store_true",
                    help="instead of deleting, replace each extra copy with a hard link to the kept "
                         "copy: every path stays, the space is freed (same volume, NTFS/ext4/...)")
@@ -315,6 +321,10 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
         print(f"dupedisk: say which copy survives with --keep {{{','.join(RULES)}}} "
               "(or compare against a folder with --against DIR)", file=sys.stderr)
         return 2
+    if args.against and (args.prefer or args.avoid):
+        print("dupedisk: --prefer/--avoid choose between copies; with --against the copies "
+              "inside the reference folder are already the ones kept", file=sys.stderr)
+        return 2
     if args.move_to:
         if args.hardlink:
             print("dupedisk: --move-to and --hardlink are alternatives", file=sys.stderr)
@@ -330,7 +340,8 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
         print(f"dupedisk: {exc}", file=sys.stderr)
         return 2
 
-    plans = plan_against(report.groups) if args.against else plan_by_rule(report.groups, args.keep)
+    plans = (plan_against(report.groups) if args.against
+             else plan_by_rule(report.groups, args.keep, args.prefer, args.avoid))
     removals = sum(len(p.remove) for p in plans)
     would_free = sum(p.freed for p in plans)
     outcome = None
@@ -359,6 +370,8 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
             "move_to": os.path.abspath(args.move_to) if args.move_to else None,
             "manifest": manifest,
             "keep": args.keep,
+            "prefer": args.prefer,
+            "avoid": args.avoid,
             "against": args.against,
             "files_scanned": report.files_scanned,
             "plan": [
@@ -380,6 +393,10 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
         else:
             basis = (f"keeping the copies in {os.path.abspath(args.against)}" if args.against
                      else f"keeping the {args.keep} copy of each set")
+            if args.prefer:
+                basis += ", preferring " + " | ".join(args.prefer)
+            if args.avoid:
+                basis += ", avoiding " + " | ".join(args.avoid)
             action = ("replace with hard links" if args.hardlink
                       else f"move to {os.path.abspath(args.move_to)}" if args.move_to else "remove")
             print(f"plan: {action} {removals:,} files from {len(plans):,} sets, "
