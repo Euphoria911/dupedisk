@@ -12,6 +12,7 @@ from dupedisk.dupes import PARTIAL_BYTES, against_reference, find_duplicates, is
 from dupedisk.similar import find_similar_names, original_stem
 from dupedisk.sizes import human, parse_age, parse_size
 from dupedisk.usage import largest_files, node_to_dict, render_tree, scan
+from dupedisk.walk import in_window
 
 
 def write(root: Path, rel: str, data: bytes) -> Path:
@@ -468,6 +469,36 @@ class UsageTests(unittest.TestCase):
         self.assertNotIn("children", leaf)
         json.dumps(data)  # plain data only
 
+    def test_in_window_boundaries(self):
+        self.assertTrue(in_window(100, None, None))
+        self.assertTrue(in_window(100, 100, None))  # "after" is inclusive
+        self.assertFalse(in_window(99.9, 100, None))
+        self.assertFalse(in_window(100, None, 100))  # "before" is exclusive
+        self.assertTrue(in_window(99.9, None, 100))
+        self.assertTrue(in_window(150, 100, 200))
+        self.assertFalse(in_window(250, 100, 200))
+
+    def test_modified_before_keeps_only_stale_files(self):
+        cutoff = self.age_files({"big/a.bin": 30, "small/c.bin": 30})
+        node = scan(str(self.root), max_depth=2, modified_before=cutoff)
+        self.assertEqual((node.size, node.files), (3010, 2))  # a.bin + c.bin
+        self.assertEqual([c.name for c in node.children], ["big", "small"])
+        big = node.children[0]
+        self.assertEqual([c.name for c in big.children], ["a.bin"])  # deep/ and top.bin are recent
+
+    def test_since_and_older_than_make_a_window(self):
+        now = os.path.getmtime(self.root / "top.bin")
+        self.age_files({"big/a.bin": 30, "big/deep/b.bin": 20, "small/c.bin": 5})
+        node = scan(str(self.root), 2, modified_after=now - 25 * 86400, modified_before=now - 10 * 86400)
+        self.assertEqual((node.size, node.files), (2000, 1))  # only b.bin sits in the window
+        self.assertEqual(scan(str(self.root), 2, modified_after=now - 1, modified_before=now - 2).files, 0)
+
+    def test_largest_modified_before(self):
+        cutoff = self.age_files({"big/a.bin": 30, "big/deep/b.bin": 40})
+        names = [Path(f.path).name for f in largest_files(str(self.root), 10, modified_before=cutoff)]
+        self.assertEqual(names, ["a.bin", "b.bin"])
+        self.assertEqual(largest_files(str(self.root), 1, modified_before=cutoff)[0].size, 3000)
+
     def test_render_note(self):
         text = render_tree(scan(str(self.root), 1), note="modified in the last 30d")
         self.assertIn("in 4 files modified in the last 30d", text.splitlines()[0])
@@ -682,6 +713,38 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("old.bin", text)
             with self.assertRaises(SystemExit):
                 self.run_cli("largest", tmp, "--since", "7")
+
+    def test_usage_and_largest_older_than(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = write(Path(tmp), "old.bin", b"x" * 500)
+            write(Path(tmp), "new.bin", b"x" * 40)
+            mid = write(Path(tmp), "mid.bin", b"x" * 90)
+            now = old.stat().st_mtime
+            os.utime(old, (now - 400 * 86400,) * 2)
+            os.utime(mid, (now - 40 * 86400,) * 2)
+
+            code, out = self.run_cli("usage", tmp, "--older-than", "30d")
+            self.assertEqual(code, 0)
+            self.assertIn("untouched for 30d", out.splitlines()[0])
+            self.assertIn("in 2 files", out)
+            self.assertNotIn("new.bin", out)
+
+            data = json.loads(self.run_cli("usage", tmp, "--older-than", "365d", "--json")[1])
+            self.assertEqual((data["older_than"], data["since"], data["tree"]["size"]), ("365d", None, 500))
+
+            # a window: modified within 100 days but not within 30
+            header = self.run_cli("usage", tmp, "--since", "100d", "--older-than", "30d")[1].splitlines()[0]
+            self.assertIn("modified in the last 100d, untouched for 30d", header)
+            self.assertIn("in 1 files", header)
+
+            data = json.loads(self.run_cli("largest", tmp, "--older-than", "30d", "--json")[1])
+            self.assertEqual([f["size"] for f in data["files"]], [500, 90])
+            self.assertEqual(data["older_than"], "30d")
+            _, text = self.run_cli("largest", tmp, "--older-than", "30d", "-n", "1")
+            self.assertIn("old.bin", text)
+            self.assertNotIn("mid.bin", text)
+            with self.assertRaises(SystemExit):
+                self.run_cli("usage", tmp, "--older-than", "1y")  # no year unit
 
     def test_usage_since_rejects_bad_age(self):
         with self.assertRaises(SystemExit):

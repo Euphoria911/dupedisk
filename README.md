@@ -16,8 +16,8 @@ python -m dupedisk dupes   PATH... [-m SIZE] [-t N] [-x PAT] [-j N] [--against D
 python -m dupedisk dedupe  PATH... (--keep RULE | --against DIR) [--hardlink | --move-to DIR] [--apply] [-m SIZE] [-t N] [-x PAT] [-j N] [--json] [-v]
 python -m dupedisk restore DIR_OR_MANIFEST [-i PAT] [--apply] [-t N] [--json] [-v]
 python -m dupedisk similar PATH... [-m SIZE] [-t N] [--identical] [-x PAT] [--json] [-v]
-python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--json] [-x PAT] [-v]
-python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--json] [-x PAT] [-v]
+python -m dupedisk usage   [PATH]  [-d DEPTH] [-t N] [--since AGE] [--older-than AGE] [--json] [-x PAT] [-v]
+python -m dupedisk largest [PATH]  [-n COUNT] [--since AGE] [--older-than AGE] [--json] [-x PAT] [-v]
 ```
 
 ```
@@ -47,6 +47,11 @@ C:\Users\me\projects  -  14.5 GiB in 39,561 files
   `m`, `h`, `d`, `w`), so you see what grew instead of what is merely big. Directories with
   nothing recent are dropped. It goes by modification time, so a file that was copied in
   with an old timestamp won't show up.
+- `--older-than 180d` is the mirror image: only files **not** modified in the last 180 days, so
+  you see what has sat untouched. Give both for a window, e.g. `--since 365d --older-than 90d`
+  is "touched in the last year, but not in the last three months". Units are `s`, `m`, `h`,
+  `d`, `w`: there is no `y`, so a year is `365d`. Same caveat as `--since`: it goes by
+  modification time, and neither access time nor creation time is used.
 - `--json` on `usage` and `largest` (as on `dupes` and `similar`) for scripts. `usage --json`
   is the whole kept tree, nested as `children`, and ignores `--top`; `-d` still sets how
   deep it goes.

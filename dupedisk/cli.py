@@ -49,10 +49,26 @@ def _age_arg(text: str) -> str:
 def _add_since(p: argparse.ArgumentParser) -> None:
     p.add_argument("--since", type=_age_arg, metavar="AGE",
                    help="count only files modified within AGE, e.g. 30d, 12h, 2w")
+    p.add_argument("--older-than", type=_age_arg, metavar="AGE",
+                   help="count only files NOT modified within AGE (stale files), e.g. 180d; "
+                        "together with --since it selects a window")
 
 
-def _cutoff(args: argparse.Namespace) -> float | None:
-    return None if args.since is None else time.time() - parse_age(args.since)
+def _window(args: argparse.Namespace) -> tuple[float | None, float | None]:
+    """(modified_after, modified_before) as epoch seconds, from ``--since`` / ``--older-than``."""
+    now = time.time()
+    after = None if args.since is None else now - parse_age(args.since)
+    before = None if args.older_than is None else now - parse_age(args.older_than)
+    return after, before
+
+
+def _window_note(args: argparse.Namespace) -> str:
+    parts = []
+    if args.since is not None:
+        parts.append(f"modified in the last {args.since}")
+    if args.older_than is not None:
+        parts.append(f"untouched for {args.older_than}")
+    return ", ".join(parts)
 
 
 def _add_scan_options(p: argparse.ArgumentParser) -> None:
@@ -486,13 +502,18 @@ def _cmd_usage(args: argparse.Namespace) -> int:
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
         return 2
     errors: list[str] = []
-    root = scan(args.path, args.depth, args.exclude, errors, _cutoff(args))
+    after, before = _window(args)
+    root = scan(args.path, args.depth, args.exclude, errors, after, before)
     if args.json:
-        payload = {"since": args.since, "tree": node_to_dict(root), "skipped": len(errors)}
+        payload = {
+            "since": args.since,
+            "older_than": args.older_than,
+            "tree": node_to_dict(root),
+            "skipped": len(errors),
+        }
         print(json.dumps(payload, indent=2))
     else:
-        note = f"modified in the last {args.since}" if args.since is not None else ""
-        sys.stdout.write(render_tree(root, args.top, note=note))
+        sys.stdout.write(render_tree(root, args.top, note=_window_note(args)))
     _report_errors(errors, args.verbose)
     return 0
 
@@ -519,10 +540,12 @@ def _cmd_largest(args: argparse.Namespace) -> int:
         print(f"dupedisk: not a directory: {args.path}", file=sys.stderr)
         return 2
     errors: list[str] = []
-    files = largest_files(args.path, args.count, args.exclude, errors, _cutoff(args))
+    after, before = _window(args)
+    files = largest_files(args.path, args.count, args.exclude, errors, after, before)
     if args.json:
         payload = {
             "since": args.since,
+            "older_than": args.older_than,
             "files": [{"path": f.path, "size": f.size} for f in files],
             "skipped": len(errors),
         }

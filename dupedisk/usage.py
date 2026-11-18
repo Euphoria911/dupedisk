@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from .sizes import human
-from .walk import FileInfo, is_excluded, is_link, walk_files
+from .walk import FileInfo, in_window, is_excluded, is_link, walk_files
 
 
 @dataclass
@@ -27,15 +27,18 @@ def scan(
     excludes: Iterable[str] = (),
     errors: list[str] | None = None,
     modified_after: float | None = None,
+    modified_before: float | None = None,
 ) -> Node:
     """Total every directory under ``root``; only nodes within ``max_depth`` are kept.
 
-    ``modified_after`` is an epoch time: older files are not counted at all, and directories
-    left with no files are dropped, so the tree shows only what changed since then.
+    ``modified_after`` / ``modified_before`` are epoch times: files outside that window are
+    not counted at all, and directories left with no files are dropped, so the tree shows
+    only what changed since then (or only what has sat untouched since).
     """
     errors = errors if errors is not None else []
     root = os.path.abspath(root)
-    return _scan(root, root, 0, max_depth, tuple(excludes), errors, modified_after)
+    window = (modified_after, modified_before)
+    return _scan(root, root, 0, max_depth, tuple(excludes), errors, window)
 
 
 def _scan(
@@ -45,8 +48,9 @@ def _scan(
     max_depth: int,
     excludes: tuple[str, ...],
     errors: list[str],
-    modified_after: float | None,
+    window: tuple[float | None, float | None],
 ) -> Node:
+    filtered = window != (None, None)
     node = Node(name, path)
     keep = depth < max_depth
     try:
@@ -60,10 +64,8 @@ def _scan(
                 if is_link(entry) or is_excluded(entry, excludes):
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    child = _scan(
-                        entry.path, entry.name, depth + 1, max_depth, excludes, errors, modified_after
-                    )
-                    if modified_after is not None and child.files == 0:
+                    child = _scan(entry.path, entry.name, depth + 1, max_depth, excludes, errors, window)
+                    if filtered and child.files == 0:
                         continue
                     node.size += child.size
                     node.files += child.files
@@ -71,7 +73,7 @@ def _scan(
                         node.children.append(child)
                 elif entry.is_file(follow_symlinks=False):
                     st = entry.stat(follow_symlinks=False)
-                    if modified_after is not None and st.st_mtime < modified_after:
+                    if not in_window(st.st_mtime, *window):
                         continue
                     node.size += st.st_size
                     node.files += 1
@@ -126,7 +128,8 @@ def largest_files(
     excludes: Iterable[str] = (),
     errors: list[str] | None = None,
     modified_after: float | None = None,
+    modified_before: float | None = None,
 ) -> list[FileInfo]:
     errors = errors if errors is not None else []
-    files = walk_files(os.path.abspath(root), excludes, errors, modified_after)
+    files = walk_files(os.path.abspath(root), excludes, errors, modified_after, modified_before)
     return heapq.nlargest(count, files, key=lambda f: f.size)

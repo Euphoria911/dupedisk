@@ -27,11 +27,21 @@ def is_link(entry: os.DirEntry) -> bool:
     return bool(is_junction and is_junction())
 
 
+def in_window(mtime: float, after: float | None, before: float | None) -> bool:
+    """True if ``mtime`` is at or after ``after`` and strictly before ``before`` (either may be
+    ``None`` for no limit). Epoch seconds."""
+    return (after is None or mtime >= after) and (before is None or mtime < before)
+
+
 def walk_files(
-    root: str, excludes: Iterable[str], errors: list[str], modified_after: float | None = None
+    root: str,
+    excludes: Iterable[str],
+    errors: list[str],
+    modified_after: float | None = None,
+    modified_before: float | None = None,
 ) -> Iterator[FileInfo]:
-    """Yield every regular file under ``root``; with ``modified_after`` (epoch seconds),
-    only files modified at or after that moment."""
+    """Yield every regular file under ``root``. ``modified_after`` / ``modified_before`` (epoch
+    seconds) keep only files modified inside that window."""
     excludes = tuple(excludes)
     stack = [root]
     while stack:
@@ -50,7 +60,7 @@ def walk_files(
                         stack.append(entry.path)
                     elif entry.is_file(follow_symlinks=False):
                         st = entry.stat(follow_symlinks=False)
-                        if modified_after is None or st.st_mtime >= modified_after:
+                        if in_window(st.st_mtime, modified_after, modified_before):
                             yield FileInfo(entry.path, st.st_size)
                 except OSError as exc:
                     errors.append(f"{entry.path}: {exc.strerror or exc}")
